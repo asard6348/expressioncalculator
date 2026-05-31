@@ -1,3 +1,5 @@
+#!/bin/python3
+
 import ast, math, tokenize, io, decimal, inspect, mpmath
 threading = None
 time      = None
@@ -906,6 +908,10 @@ def actions(s: str) -> bool:
         print(f"\x1b[32mImaginary mode: {'ON' if IMG else 'OFF'}{RST}")
         return True
 
+    if cmd == "quit":
+        print("(Quit)")
+        exit()
+
     if cmd.startswith('prec'):
         parts = cmd.split()
         if len(parts) == 1:
@@ -1022,111 +1028,64 @@ def apply_inline(inline_str: str, all_vars: list, base: dict, isolate: bool) -> 
     return work if isolate else base
 
 
-while True:
-    raw = input().strip()
-    if actions(raw): continue
-    if not raw or raw.lower() == 'new': continue
-
-    inline_str, exp = split_inline(raw)
-    if not exp:
-        if inline_str:
-            all_vars = getv(raw)
-            apply_inline(inline_str, all_vars, _user_vars, False)
-            for k, v in _user_vars.items():
-                if isinstance(v, Lambda):
-                    print(f"  {k} = {v}")
-        else:
-            print(_fmt_error("No expression found after assignments."))
-        continue
-
-    all_vars     = getv(raw)
-    assigned_set = {p.split('=', 1)[0].strip() for p in inline_str.split() if '=' in p}
-    already_set  = set(_user_vars.keys())
-    det_vars     = sorted(set(all_vars) - assigned_set - already_set)
-
-    probe = cal(exp, {v: dec(0) for v in getv(exp)}, chk=True)
-    if not isinstance(probe, dec):
-        success = spdwarn()
-        res = cal(exp, {**_user_vars, **{v: dec(0) for v in getv(exp)}})
-        success[0] = True
-        if isinstance(res, Lambda) and not assigned_set:
-            _last_lambda[0] = res
-        print(res)
-        continue
-
-    cur_vars = _user_vars.copy()
-
-    if inline_str:
-        cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE)
-
-    if det_vars:
-        broken = False
-        for v in det_vars:
-            while True:
-                v_inp = input(f"Variable {v}: ").strip()
-                if actions(v_inp): continue
-                if v_inp.lower() == 'new': broken = True; break
-                success = spdwarn()
-                ev = cal(v_inp, cur_vars)
-                success[0] = True
-                if isinstance(ev, Lambda):
-                    cur_vars[v] = ev
-                    _user_vars[v] = ev
-                elif isinstance(ev, dec):
-                    cur_vars[v] = ev
-                else:
-                    cur_vars[v] = dec(0)
-                break
-            if broken: break
-        if broken: continue
-
-    if inline_str:
-        cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE)
-
-    success = spdwarn()
-    res = cal(exp, cur_vars)
-    success[0] = True
-    if isinstance(res, Lambda) and not assigned_set: _last_lambda[0] = res
-    print(res)
-
+try:
     while True:
-        inp = input().strip()
-        if actions(inp): continue
-        if inp.lower() == 'new': break
-        if not inp:
-            success = spdwarn()
-            res = cal(exp, cur_vars)
-            success[0] = True
-            if isinstance(res, Lambda) and not assigned_set: _last_lambda[0] = res
-            print(res); continue
+        raw = input("> ").strip()
+        if actions(raw): continue
+        if not raw or raw.lower() == 'new': continue
 
-        if '=' in inp:
-            assigns = sorta(inp, all_vars)
-            if not assigns: continue
-            err = False; tmp = cur_vars.copy()
-            success = spdwarn()
-            for tgt, val in assigns:
-                ev = cal(val, tmp)
-                if isinstance(ev, (dec, Lambda)):
-                    tmp[tgt] = ev
-                    if isinstance(ev, Lambda): _user_vars[tgt] = ev
-                else:
-                    print(ev); err = True; break
-            success[0] = True
-            if err: continue
-            cur_vars = tmp
-        else:
-            success = spdwarn()
-            ev = cal(inp, cur_vars)
-            success[0] = True
-            if isinstance(ev, Lambda):
-                print(ev)
-                continue
-            target_list = det_vars if det_vars else sorted(set(all_vars) - already_set - assigned_set)
-            if isinstance(ev, dec) and target_list:
-                cur_vars[target_list[0]] = ev
+        inline_str, exp = split_inline(raw)
+        if not exp:
+            if inline_str:
+                all_vars = getv(raw)
+                apply_inline(inline_str, all_vars, _user_vars, False)
+                for k, v in _user_vars.items():
+                    if isinstance(v, Lambda):
+                        print(f"  {k} = {v}")
             else:
-                print(ev); continue
+                print(_fmt_error("No expression found after assignments."))
+            continue
+
+        all_vars     = getv(raw)
+        assigned_set = {p.split('=', 1)[0].strip() for p in inline_str.split() if '=' in p}
+        already_set  = set(_user_vars.keys())
+        det_vars     = sorted(set(all_vars) - assigned_set - already_set)
+
+        probe = cal(exp, {v: dec(0) for v in getv(exp)}, chk=True)
+        if not isinstance(probe, dec):
+            success = spdwarn()
+            res = cal(exp, {**_user_vars, **{v: dec(0) for v in getv(exp)}})
+            success[0] = True
+            if isinstance(res, Lambda) and not assigned_set:
+                _last_lambda[0] = res
+            print(res)
+            continue
+
+        cur_vars = _user_vars.copy()
+
+        if inline_str:
+            cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE)
+
+        if det_vars:
+            broken = False
+            for v in det_vars:
+                while True:
+                    v_inp = input(f"Variable '{v}'> ").strip()
+                    if actions(v_inp): continue
+                    if v_inp.lower() == 'new': broken = True; break
+                    success = spdwarn()
+                    ev = cal(v_inp, cur_vars)
+                    success[0] = True
+                    if isinstance(ev, Lambda):
+                        cur_vars[v] = ev
+                        _user_vars[v] = ev
+                    elif isinstance(ev, dec):
+                        cur_vars[v] = ev
+                    else:
+                        cur_vars[v] = dec(0)
+                    break
+                if broken: break
+            if broken: continue
 
         if inline_str:
             cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE)
@@ -1136,3 +1095,57 @@ while True:
         success[0] = True
         if isinstance(res, Lambda) and not assigned_set: _last_lambda[0] = res
         print(res)
+
+
+        while True:
+            inp = input("> ").strip()
+            if actions(inp): continue
+            if inp.lower() == 'new': break
+            if not inp:
+                success = spdwarn()
+                res = cal(exp, cur_vars)
+                success[0] = True
+                if isinstance(res, Lambda) and not assigned_set: _last_lambda[0] = res
+                print(res); continue
+
+            if '=' in inp:
+                assigns = sorta(inp, all_vars)
+                if not assigns: continue
+                err = False; tmp = cur_vars.copy()
+                success = spdwarn()
+                for tgt, val in assigns:
+                    ev = cal(val, tmp)
+                    if isinstance(ev, (dec, Lambda)):
+                        tmp[tgt] = ev
+                        if isinstance(ev, Lambda): _user_vars[tgt] = ev
+                    else:
+                        print(ev); err = True; break
+                success[0] = True
+                if err: continue
+                cur_vars = tmp
+            else:
+                success = spdwarn()
+                ev = cal(inp, cur_vars)
+                success[0] = True
+                if isinstance(ev, Lambda):
+                    print(ev)
+                    continue
+                target_list = det_vars if det_vars else sorted(set(all_vars) - already_set - assigned_set)
+                if isinstance(ev, dec) and target_list:
+                    cur_vars[target_list[0]] = ev
+                else:
+                    print(ev); continue
+
+            if inline_str:
+                cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE)
+
+            success = spdwarn()
+            res = cal(exp, cur_vars)
+            success[0] = True
+            if isinstance(res, Lambda) and not assigned_set: _last_lambda[0] = res
+            print(res)
+except EOFError:
+    print("(Quit)")
+    exit()
+except KeyboardInterrupt:
+    print("(Interrupt)")
