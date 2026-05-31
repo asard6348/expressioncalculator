@@ -11,7 +11,6 @@ mpmath.mp.dps = 55
 ISO_INLINE   = True
 GUARD_DIGITS = 20
 IMG          = False
-_TOK_STRING  = 200
 
 RED    = "\x1b[38;2;255;0;0m"
 YELLOW = "\x1b[38;2;204;204;0m"
@@ -21,6 +20,10 @@ GRAY   = "\x1b[38;2;104;104;104m"
 BOLD   = "\x1b[1m"
 RST    = "\x1b[0m"
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TOKENISER  (defined early so Lambda.__init__ can call getv)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class Tok:
     __slots__ = ('type', 'string')
@@ -90,13 +93,16 @@ def _should_split(name: str) -> bool:
     return all(t.string in dco and not callable(dco[t.string]) for t in toks)
 
 
+_TOK_STRING = 200   # our custom token type for string literals
+
 def get_clean_tokens(s: str) -> list:
     raw_tokens = []
     try:
         gen = tokenize.tokenize(io.BytesIO(s.encode('utf-8')).readline)
         for t in gen:
+            # ── String literals → Lambda tokens ────────────────────────────
             if t.type == tokenize.STRING:
-                inner = t.string[1:-1]
+                inner = t.string[1:-1]   # strip surrounding quotes
                 raw_tokens.append(Tok(_TOK_STRING, inner))
                 continue
 
@@ -162,12 +168,21 @@ def getv(s: str) -> list:
     return sorted(found)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# LAMBDA  — symbolic function stored as an expression string
+# ═══════════════════════════════════════════════════════════════════════════════
+
 class Lambda:
+    """A symbolic function: stores expr as a string, evaluates lazily via cal()."""
+
     def __init__(self, expr: str, params: list = None):
         self.expr   = expr
+        # params: ordered list of free variable names (auto-detected if None)
         self.params = list(params) if params is not None else getv(expr)
 
+    # ── Evaluation ────────────────────────────────────────────────────────────
     def __call__(self, *args):
+        """Substitute positional args for params and evaluate."""
         v = {}
         for name, val in zip(self.params, args):
             if isinstance(val, dec):
@@ -177,9 +192,10 @@ class Lambda:
             elif isinstance(val, (int, float)):
                 v[name] = dec(str(val))
             else:
-                v[name] = val
-        return cal(self.expr, v)
+                v[name] = val          # nested Lambda etc.
+        return cal(self.expr, v)       # cal resolved at call time
 
+    # ── Arithmetic — mixing Lambda with dec produces a new Lambda ─────────────
     def _arith(self, other, op: str, flipped: bool = False):
         if isinstance(other, Lambda):
             params = list(self.params)
@@ -212,6 +228,10 @@ class Lambda:
     def __str__(self):
         return self.__repr__()
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DCO  — the evaluation namespace
+# ═══════════════════════════════════════════════════════════════════════════════
 
 dco = {
     name: getattr(ctx, name)
@@ -297,6 +317,7 @@ _repin_constants()
 dco.pop('inf', None)
 
 
+# ── Quantum: hydrogen energy levels ──────────────────────────────────────────
 def _hydrogen_e(n):
     n = int(n)
     if n < 1: return _fmt_error("hydrogen_e: n must be ≥ 1")
@@ -304,6 +325,11 @@ def _hydrogen_e(n):
 dco['hydrogen_e'] = _hydrogen_e
 
 
+# ── Quantum: anharmonic oscillator  H = p²/2 + x²/2 + c·x⁴ ──────────────────
+# Correct x⁴ matrix elements in harmonic-oscillator basis (ℏ=m=ω=1, x=(a+a†)/√2):
+#   ⟨n|x⁴|n⟩     = (6n²+6n+3)/4
+#   ⟨n+2|x⁴|n⟩   = (2n+3)√((n+1)(n+2))/2
+#   ⟨n+4|x⁴|n⟩   = √((n+1)(n+2)(n+3)(n+4))/4
 def _solve_anharmonic(n, c):
     n = int(n); c = mpmath.mpf(str(c))
     N = max(60, n + 50)
@@ -322,6 +348,8 @@ def _solve_anharmonic(n, c):
 dco['anh'] = _solve_anharmonic
 
 
+# ── Quantum: 1-D Schrödinger solver (finite-difference TISE) ─────────────────
+# [−½ ∂²/∂x² + V(x)] ψ = Eψ,  Dirichlet BC at xmin / xmax
 def _solve_schrodinger(V_expr, n, xmin, xmax, Npts=100):
     n = int(n); Npts = int(Npts)
     xmin_m = mpmath.mpf(str(xmin)); xmax_m = mpmath.mpf(str(xmax))
@@ -341,7 +369,12 @@ def _solve_schrodinger(V_expr, n, xmin, xmax, Npts=100):
     return dec(mpmath.nstr(vals[n], mpmath.mp.dps))
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SYMBOLIC DIFFERENTIATION  (ast-based, returns Lambda)
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def _simp(node):
+    """Light algebraic simplification of an AST node."""
     if isinstance(node, ast.BinOp):
         L, R = _simp(node.left), _simp(node.right)
         op   = node.op
@@ -368,9 +401,10 @@ def _simp(node):
             if ro: return L
             if lz: return ast.Constant(value=0)
 
+        # fold two numeric constants
         if isinstance(L, ast.Constant) and isinstance(R, ast.Constant):
             try:
-                v = eval(ast.unparse(ast.BinOp(L, op, R)))
+                v = eval(ast.unparse(ast.BinOp(L, op, R)))   # safe: both consts
                 if isinstance(v, (int, float)) and not isinstance(v, bool):
                     return ast.Constant(value=v)
             except Exception:
@@ -384,7 +418,7 @@ def _simp(node):
         if isinstance(node.op, ast.USub):
             if isinstance(op, ast.Constant):   return ast.Constant(value=-op.value)
             if isinstance(op, ast.UnaryOp) and isinstance(op.op, ast.USub):
-                return op.operand
+                return op.operand              # --x  →  x
         elif isinstance(node.op, ast.UAdd):
             return op
         node.operand = op
@@ -398,10 +432,12 @@ def _simp(node):
 
 
 def _C(name, *args):
+    """Build ast.Call node for a named function."""
     return ast.Call(ast.Name(name, ast.Load()), list(args), [])
 
 
 def _diff_node(node, var: str):
+    """Recursively differentiate an AST node with respect to var."""
     if isinstance(node, ast.Constant):
         return ast.Constant(value=0)
 
@@ -422,13 +458,13 @@ def _diff_node(node, var: str):
         if isinstance(op, (ast.Add, ast.Sub)):
             return _simp(ast.BinOp(dL, op, dR))
 
-        if isinstance(op, ast.Mult):
+        if isinstance(op, ast.Mult):           # product rule
             return _simp(ast.BinOp(
                 ast.BinOp(dL, ast.Mult(), R),
                 ast.Add(),
                 ast.BinOp(L, ast.Mult(), dR)))
 
-        if isinstance(op, ast.Div):
+        if isinstance(op, ast.Div):            # quotient rule
             return _simp(ast.BinOp(
                 ast.BinOp(
                     ast.BinOp(dL, ast.Mult(), R),
@@ -440,11 +476,13 @@ def _diff_node(node, var: str):
         if isinstance(op, ast.Pow):
             dR_s = _simp(dR)
             if isinstance(dR_s, ast.Constant) and dR_s.value == 0:
+                # power rule:  n · base^(n-1) · dL
                 return _simp(ast.BinOp(
                     ast.BinOp(R, ast.Mult(),
                         ast.BinOp(L, ast.Pow(),
                             _simp(ast.BinOp(R, ast.Sub(), ast.Constant(value=1))))),
                     ast.Mult(), _simp(dL)))
+            # general:  f^g · (g'·ln f + g·f'/f)
             dL_s = _simp(dL)
             inner = _simp(ast.BinOp(
                 ast.BinOp(dR_s, ast.Mult(), _C('log', L)),
@@ -496,6 +534,7 @@ def _diff_node(node, var: str):
 
 
 def _symbolic_diff(expr_str: str, var: str, order: int = 1) -> str:
+    """Return symbolic derivative of expr_str wrt var (n-th order), as a string."""
     try:
         tree = ast.parse(expr_str, mode='eval')
         node = tree.body
@@ -508,7 +547,9 @@ def _symbolic_diff(expr_str: str, var: str, order: int = 1) -> str:
         return f"\x1b[38;2;255;0;0mSymbolic diff error: {err}\x1b[0m"
 
 
+# ── diff() in dco  →  returns Lambda ─────────────────────────────────────────
 def _diff_lambda(f, order=None):
+    """diff(f)  or  diff(f, n)  — symbolic derivative of Lambda f, returns Lambda."""
     if not isinstance(f, Lambda):
         return _fmt_error("diff() expects a Lambda (quoted expression).  "
                           "Example:  f=\"sin(x)\"  then  diff(f)")
@@ -518,13 +559,18 @@ def _diff_lambda(f, order=None):
     n      = int(order) if isinstance(order, dec) else 1
     d_expr = _symbolic_diff(f.expr, var, n)
     if d_expr.startswith('\x1b'):
-        return d_expr
+        return d_expr          # pass error string through
     return Lambda(d_expr, f.params)
 
 dco['diff'] = _diff_lambda
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# NATIVE-MPMATH EVALUATOR  (bypasses Decimal for diff / integrate)
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def _cal_mpf(expr: str, var: str, t):
+    """Evaluate expr with <var>=t (mpmath type) using pure mpmath arithmetic."""
     _env = {}
     for _n in dir(mpmath):
         if _n.startswith('_'): continue
@@ -562,14 +608,19 @@ def _cal_mpf(expr: str, var: str, t):
         return mpmath.mpf('0')
 
 
-_user_vars:   dict  = {}
-_last_lambda: list  = [None]
+# ═══════════════════════════════════════════════════════════════════════════════
+# PERSISTENT VARIABLE STORE  (Lambdas survive between expressions)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_user_vars:   dict  = {}    # persists across outer-loop iterations
+_last_lambda: list  = [None] # [0] = last Lambda result (for `run`)
 
 
 def _fmt_error(msg: str) -> str:
     return f"{RED}{msg}{RST}"
 
 
+# ── Banner ────────────────────────────────────────────────────────────────────
 print(
     f"  {BOLD}calc{RST}     arbitrary precision expression REPL\n\n"
     f"  {BOLD}ops    {RST}  + − * / **\n"
@@ -582,6 +633,10 @@ print(
     f"  {BOLD}inline {RST}  f=\"sin(x)\"; 1+diff(f)   or   f=\"sin(x)\" 1+diff(f)\n"
 )
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EVALUATOR
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _display(result: dec) -> dec:
     quantizer = dec(10) ** -(DISPLAY_PREC - 1)
@@ -633,14 +688,16 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
                 )
 
                 if insert_mul and t.string == '(' and prev_is_name:
+                    # Don't insert * before ( if prev is a callable (function call)
                     if callable(dco.get(prev.string)):
                         insert_mul = False
                     elif isinstance(v_dict.get(prev.string), Lambda):
-                        insert_mul = False
+                        insert_mul = False   # Lambda variable being called: f(x)
 
                 if insert_mul:
                     parts.append('*')
 
+            # Emit token
             if t.type == tokenize.NUMBER:
                 if t.string.lower().endswith('j'):
                     coeff = t.string[:-1] or '1'
@@ -648,6 +705,7 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
                 else:
                     parts.append(f'dec("{t.string}")')
             elif t.type == _TOK_STRING:
+                # Quoted string → Lambda literal
                 safe = t.string.replace('\\', '\\\\').replace('"', '\\"')
                 parts.append(f'Lambda("{safe}")')
             else:
@@ -659,9 +717,11 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
         try:
             raw = eval(fin, {"__builtins__": {}}, env)
 
+            # ── Lambda result (symbolic function) ──────────────────────────
             if isinstance(raw, Lambda):
                 return raw
 
+            # ── Complex result ──────────────────────────────────────────────
             if isinstance(raw, mpmath.mpc):
                 im = dec(mpmath.nstr(raw.imag, mpmath.mp.dps))
                 if abs(im) < dec('1e-' + str(ctx.prec - 2)):
@@ -672,6 +732,7 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
                     return _fmt_error("No real solutions.")
                 return _display_complex(raw)
 
+            # ── Real result ─────────────────────────────────────────────────
             if isinstance(raw, mpmath.mpf):
                 raw = dec(mpmath.nstr(raw, mpmath.mp.dps))
             elif not isinstance(raw, dec):
@@ -703,6 +764,8 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
     except Exception as e:
         return _fmt_error(f"Calculation problem: {e}.")
 
+
+# ── repeat (needs cal) ────────────────────────────────────────────────────────
 
 def _parse_repeat(expr: str):
     s = expr.strip()
@@ -743,6 +806,10 @@ def _eval_repeat(expr: str, v_dict: dict, chk: bool = False):
     return result
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# HELP
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def hlp():
     avf = ", ".join(sorted([
         k + (('(' + ', '.join(str(p) for p in inspect.signature(v).parameters.values()) + ')')
@@ -782,6 +849,10 @@ def hlp():
   repeat(expr, n) — evaluate expr n times, threading the first variable
 """)
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COMMAND HANDLERS
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _do_schrodinger(raw: str) -> bool:
     parts = raw.strip().split()
@@ -837,7 +908,9 @@ def _do_integrate(raw: str) -> bool:
 
 
 def _do_run(raw: str) -> bool:
-    args_str = raw.strip().split()[1:]
+    """run [val val2 …] — evaluate the current unassigned Lambda output.
+    If the Lambda has no free parameters (e.g. f()='10**2'), args are optional."""
+    args_str = raw.strip().split()[1:]   # drop 'run'
 
     lam = _last_lambda[0]
     if not isinstance(lam, Lambda):
@@ -845,6 +918,7 @@ def _do_run(raw: str) -> bool:
                          "Evaluate an expression that returns a function first."))
         return True
 
+    # No-param Lambda: just evaluate with no arguments
     if not lam.params:
         result = lam()
         if isinstance(result, dec):
@@ -856,6 +930,7 @@ def _do_run(raw: str) -> bool:
             print(result)
         return True
 
+    # Parameterised Lambda: require at least one argument
     if not args_str:
         p = ', '.join(lam.params)
         print(_fmt_error(f"Usage: run <{p}>"))
@@ -937,6 +1012,10 @@ def actions(s: str) -> bool:
     return False
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# INLINE ASSIGNMENT HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def sorta(s: str, allowed: list) -> list:
     tokens, current, depth = [], '', 0
     in_str = False; str_char = ''
@@ -1017,18 +1096,29 @@ def apply_inline(inline_str: str, all_vars: list, base: dict, isolate: bool) -> 
         success[0] = True
         if isinstance(ev, (dec, Lambda)):
             work[tgt] = ev
-            if isinstance(ev, Lambda):
+            if isinstance(ev, Lambda):          # persist Lambda definitions
                 _user_vars[tgt] = ev
     return work if isolate else base
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# REPL
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_pending_expr: list = [None]   # inner loop feeds unrecognised input back as new expression
+
 while True:
-    raw = input().strip()
+    if _pending_expr[0] is not None:
+        raw = _pending_expr[0]
+        _pending_expr[0] = None
+    else:
+        raw = input("Expression: ").strip()
     if actions(raw): continue
     if not raw or raw.lower() == 'new': continue
 
     inline_str, exp = split_inline(raw)
     if not exp:
+        # Pure assignment(s) with no expression to evaluate
         if inline_str:
             all_vars = getv(raw)
             apply_inline(inline_str, all_vars, _user_vars, False)
@@ -1041,6 +1131,7 @@ while True:
 
     all_vars     = getv(raw)
     assigned_set = {p.split('=', 1)[0].strip() for p in inline_str.split() if '=' in p}
+    # Exclude variables already defined (numbers or Lambdas) from user prompts
     already_set  = set(_user_vars.keys())
     det_vars     = sorted(set(all_vars) - assigned_set - already_set)
 
@@ -1054,6 +1145,7 @@ while True:
         print(res)
         continue
 
+    # Start cur_vars from persistent store
     cur_vars = _user_vars.copy()
 
     if inline_str:
@@ -1088,6 +1180,10 @@ while True:
     success[0] = True
     if isinstance(res, Lambda) and not assigned_set: _last_lambda[0] = res
     print(res)
+
+    # No free variables → nothing to iterate on, go straight back to Expression prompt
+    if not all_vars:
+        continue
 
     while True:
         inp = input().strip()
@@ -1126,7 +1222,9 @@ while True:
             if isinstance(ev, dec) and target_list:
                 cur_vars[target_list[0]] = ev
             else:
-                print(ev); continue
+                # Not a usable value for any variable — treat as a new expression
+                _pending_expr[0] = inp
+                break
 
         if inline_str:
             cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE)
