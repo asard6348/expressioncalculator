@@ -1,4 +1,4 @@
-import ast, math, tokenize, io, decimal, inspect, mpmath
+import ast, math, tokenize, io, decimal, inspect, mpmath, re
 threading = None
 time      = None
 
@@ -11,6 +11,7 @@ mpmath.mp.dps = 55
 ISO_INLINE   = True
 GUARD_DIGITS = 20
 IMG          = False
+_LONGVAR_RE = re.compile(r'^_([A-Za-z][A-Za-z0-9]*)_$')
 
 RED    = "\x1b[38;2;255;0;0m"
 YELLOW = "\x1b[38;2;204;204;0m"
@@ -30,6 +31,54 @@ class Tok:
     def __repr__(self):
         return f'Tok({self.type}, {self.string!r})'
 
+class SubProxy:
+    __slots__ = ('name', 'env')
+    def __init__(self, name: str, env: dict):
+        self.name = name
+        self.env  = env
+    def __getitem__(self, key):
+        k = f"{self.name}[{int(key)}]"
+        if k in self.env:
+            return self.env[k]
+        raise NameError(f"'{k}' is not defined")
+    def __repr__(self):
+        return f"SubProxy({self.name!r})"
+
+
+def get_sub_specs(s: str) -> list:
+    specs  = []
+    seen   = set()
+    tokens = get_clean_tokens(s)
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if (t.type == tokenize.NAME and t.string not in dco and
+                i + 1 < len(tokens) and
+                tokens[i+1].type == tokenize.OP and
+                tokens[i+1].string == '['):
+            j = i + 2
+            depth = 1
+            while j < len(tokens):
+                if   tokens[j].string == '[': depth += 1
+                elif tokens[j].string == ']':
+                    depth -= 1
+                    if depth == 0: break
+                j += 1
+            index_expr = ''.join(tk.string for tk in tokens[i+2:j])
+            key = (t.string, index_expr)
+            if key not in seen:
+                specs.append((t.string, index_expr))
+                seen.add(key)
+            i = j + 1
+            continue
+        i += 1
+    return specs
+
+def _is_longvar(s: str) -> bool:
+    return bool(_LONGVAR_RE.match(s))
+
+def _longvar_inner(s: str) -> str:
+    return s[1:-1]
 
 def _split_alnum(s: str) -> list:
     raw_segs = []
@@ -52,6 +101,8 @@ def _split_alnum(s: str) -> list:
     for kind, val in raw_segs:
         if kind == tokenize.NUMBER:
             result.append(Tok(tokenize.NUMBER, val))
+        elif _is_longvar(val):
+            result.append(Tok(tokenize.NAME, val))
         else:
             result.extend(_greedy_name(val))
     return result
@@ -93,6 +144,7 @@ def _should_split(name: str) -> bool:
 _TOK_STRING = 200                                              
 
 def get_clean_tokens(s: str) -> list:
+    s = re.sub(r'(\d)(_[A-Za-z])', r'\1 \2', s)
     raw_tokens = []
     try:
         gen = tokenize.tokenize(io.BytesIO(s.encode('utf-8')).readline)
@@ -114,6 +166,9 @@ def get_clean_tokens(s: str) -> list:
                 continue
 
             if t.type == tokenize.NAME:
+                if _is_longvar(t.string):
+                    raw_tokens.append(Tok(t.type, t.string))
+                    continue
                 if t.string not in dco:
                     has_digit = any(c.isdigit() for c in t.string)
                     if has_digit:
@@ -158,24 +213,74 @@ def get_clean_tokens(s: str) -> list:
 
 
 def getv(s: str) -> list:
-    found = set()
-    for t in get_clean_tokens(s):
-        if t.type == tokenize.NAME and len(t.string) == 1 and t.string not in dco:
-            found.add(t.string)
+    found  = set()
+    tokens = get_clean_tokens(s)
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t.type == tokenize.NAME:
+            if (i + 1 < len(tokens) and
+                    tokens[i+1].type == tokenize.OP and
+                    tokens[i+1].string == '['):
+                j = i + 2
+                depth = 1
+                while j < len(tokens):
+                    if   tokens[j].string == '[': depth += 1
+                    elif tokens[j].string == ']':
+                        depth -= 1
+                        if depth == 0: break
+                    j += 1
+                for it in tokens[i+2:j]:
+                    if it.type == tokenize.NAME:
+                        if (len(it.string) == 1 and it.string not in dco) or _is_longvar(it.string):
+                            found.add(it.string)
+                i = j + 1
+                continue
+            elif (len(t.string) == 1 and t.string not in dco) or _is_longvar(t.string):
+                found.add(t.string)
+        i += 1
+    return sorted(found)
+
+def _get_lambda_params(expr: str) -> list:
+    found  = set()
+    tokens = get_clean_tokens(expr)
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t.type == tokenize.NAME:
+            if (i + 1 < len(tokens) and
+                    tokens[i+1].type == tokenize.OP and
+                    tokens[i+1].string == '['):
+                j = i + 2
+                depth = 1
+                while j < len(tokens):
+                    if   tokens[j].string == '[': depth += 1
+                    elif tokens[j].string == ']':
+                        depth -= 1
+                        if depth == 0: break
+                    j += 1
+                idx_toks = tokens[i+2:j]
+                for it in idx_toks:
+                    if it.type == tokenize.NAME:
+                        if (len(it.string) == 1 and it.string not in dco) or _is_longvar(it.string):
+                            found.add(it.string)
+                if len(idx_toks) == 1 and idx_toks[0].type == tokenize.NUMBER:
+                    found.add(f"{t.string}[{idx_toks[0].string}]")
+                i = j + 1
+                continue
+            elif (len(t.string) == 1 and t.string not in dco) or _is_longvar(t.string):
+                found.add(t.string)
+        i += 1
     return sorted(found)
 
 
 class Lambda:
-    """A symbolic function: stores expr as a string, evaluates lazily via cal()."""
-
     def __init__(self, expr: str, params: list = None):
         self.expr   = expr
-
-        self.params = list(params) if params is not None else getv(expr)
+        self.params = list(params) if params is not None else _get_lambda_params(expr)
 
 
     def __call__(self, *args):
-        """Substitute positional args for params and evaluate."""
         v = {}
         for name, val in zip(self.params, args):
             if isinstance(val, dec):
@@ -240,7 +345,7 @@ def spdwarn():
         except ImportError: pass
     else: canwrn = True
     if canwrn:
-        def wrn(suc, timeout=3):
+        def wrn(suc, timeout=4):
             time.sleep(timeout)
             if not suc[0]:
                 print(f"{YELLOW}Speed tip: install gmpy2{RST}")
@@ -288,6 +393,8 @@ dco['int']    = _int
 dco['round']  = _round
 dco['rad']    = dco.pop('radians')
 dco['repeat'] = lambda *_: _fmt_error("repeat() must be a top-level call: repeat(expr, n)")
+dco['true']   = True
+dco['false']  = False
 
 if IMG:
     dco['j'] = mpmath.mpc(0, 1)
@@ -352,7 +459,6 @@ def _solve_schrodinger(V_expr, n, xmin, xmax, Npts=100):
 
 
 def _simp(node):
-    """Light algebraic simplification of an AST node."""
     if isinstance(node, ast.BinOp):
         L, R = _simp(node.left), _simp(node.right)
         op   = node.op
@@ -410,12 +516,10 @@ def _simp(node):
 
 
 def _C(name, *args):
-    """Build ast.Call node for a named function."""
     return ast.Call(ast.Name(name, ast.Load()), list(args), [])
 
 
 def _diff_node(node, var: str):
-    """Recursively differentiate an AST node with respect to var."""
     if isinstance(node, ast.Constant):
         return ast.Constant(value=0)
 
@@ -508,11 +612,16 @@ def _diff_node(node, var: str):
             if fn in rule:
                 return rule[fn]()
 
+    if isinstance(node, ast.Subscript):
+        try:
+            return ast.Constant(value=1 if ast.unparse(node) == var else 0)
+        except Exception:
+            return ast.Constant(value=0)
+
     return ast.Constant(value=0)
 
 
 def _symbolic_diff(expr_str: str, var: str, order: int = 1) -> str:
-    """Return symbolic derivative of expr_str wrt var (n-th order), as a string."""
     try:
         tree = ast.parse(expr_str, mode='eval')
         node = tree.body
@@ -526,7 +635,6 @@ def _symbolic_diff(expr_str: str, var: str, order: int = 1) -> str:
 
 
 def _diff_lambda(f, order=None):
-    """diff(f)  or  diff(f, n)  — symbolic derivative of Lambda f, returns Lambda."""
     if not isinstance(f, Lambda):
         return _fmt_error("diff() expects a Lambda (quoted expression).  "
                           "Example:  f=\"sin(x)\"  then  diff(f)")
@@ -543,7 +651,6 @@ dco['diff'] = _diff_lambda
 
 
 def _cal_mpf(expr: str, var: str, t):
-    """Evaluate expr with <var>=t (mpmath type) using pure mpmath arithmetic."""
     _env = {}
     for _n in dir(mpmath):
         if _n.startswith('_'): continue
@@ -677,6 +784,14 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
 
         fin = "".join(parts)
         env = {**dco, **v_dict, 'dec': dec, 'mpmath': mpmath, 'Lambda': Lambda}
+
+        sub_bases = set()
+        for k in v_dict:
+            m = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\[\d+\]$', str(k))
+            if m:
+                sub_bases.add(m.group(1))
+        for base in sub_bases:
+            env[base] = SubProxy(base, env)
 
         try:
             raw = eval(fin, {"__builtins__": {}}, env)
@@ -862,8 +977,6 @@ def _do_integrate(raw: str) -> bool:
 
 
 def _do_run(raw: str) -> bool:
-    """run [val val2 …] — evaluate the current unassigned Lambda output.
-    If the Lambda has no free parameters (e.g. f()='10**2'), args are optional."""
     args_str = raw.strip().split()[1:]               
 
     lam = _last_lambda[0]
@@ -991,7 +1104,7 @@ def sorta(s: str, allowed: list) -> list:
         if '=' in p:
             tgt, val = p.split('=', 1)
             tgt = tgt.strip()
-            if tgt in allowed:
+            if tgt in allowed or re.match(r'^[A-Za-z_][A-Za-z0-9_]*\[\d+\]$', tgt):
                 deps = [x for x in allowed if x in val]
                 pairs.append((tgt, val, deps))
 
@@ -1030,8 +1143,13 @@ def split_inline(s: str):
     if current: tokens.append(current)
 
     def is_assign(t):
-        return (len(t) >= 3 and '=' in t and t[0].isalpha()
-                and t[t.index('=')-1].isalpha() and t[t.index('=')+1] not in ('=',))
+        eq = t.find('=')
+        if eq == -1 or (eq + 1 < len(t) and t[eq + 1] == '='):
+            return False
+        lhs = t[:eq]
+        return ((len(lhs) == 1 and lhs.isalpha()) or
+                _is_longvar(lhs) or
+                bool(re.match(r'^[A-Za-z_][A-Za-z0-9_]*\[\d+\]$', lhs)))
 
     assign_parts = [t for t in tokens if is_assign(t)]
     expr_parts   = [t for t in tokens if not is_assign(t)]
@@ -1098,11 +1216,12 @@ try:
         if inline_str:
             cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE)
 
+        broken = False
         if det_vars:
-            broken = False
             for v in det_vars:
                 while True:
-                    v_inp = input(f"{VIOLET}{v}:{RST} ").strip()
+                    v_disp = _longvar_inner(v) if _is_longvar(v) else v
+                    v_inp = input(f"{VIOLET}{v_disp}:{RST} ").strip()
                     if actions(v_inp): continue
                     if v_inp.lower() == 'new': broken = True; break
                     success = spdwarn()
@@ -1122,6 +1241,38 @@ try:
         if inline_str:
             cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE)
 
+        asked_sub_keys = []
+        seen_sub = set()
+        for base, index_expr in get_sub_specs(exp):
+            idx_v = cal(index_expr, cur_vars)
+            if not isinstance(idx_v, dec):
+                continue
+            idx = int(idx_v)
+            key = f"{base}[{idx}]"
+            if key in seen_sub or key in cur_vars:
+                seen_sub.add(key)
+                continue
+            if key in _user_vars:
+                cur_vars[key] = _user_vars[key]
+                seen_sub.add(key)
+                continue
+            seen_sub.add(key)
+            asked_sub_keys.append(key)
+            while True:
+                v_inp = input(f"{VIOLET}{base}[{idx}]:{RST} ").strip()
+                if actions(v_inp): continue
+                if v_inp.lower() == 'new': broken = True; break
+                success = spdwarn()
+                ev = cal(v_inp, cur_vars)
+                success[0] = True
+                cur_vars[key] = ev if isinstance(ev, dec) else dec(0)
+                break
+            if broken: break
+        if broken: continue
+
+        if inline_str:
+            cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE)
+
         success = spdwarn()
         res = cal(exp, cur_vars)
         success[0] = True
@@ -1129,7 +1280,7 @@ try:
         print(res)
 
 
-        if not all_vars:
+        if not all_vars and not asked_sub_keys:
             continue
 
         while True:
@@ -1165,7 +1316,7 @@ try:
                 if isinstance(ev, Lambda):
                     print(ev)
                     continue
-                target_list = det_vars if det_vars else sorted(set(all_vars) - already_set - assigned_set)
+                target_list = det_vars if det_vars else asked_sub_keys if asked_sub_keys else sorted(set(all_vars) - already_set - assigned_set)
                 if isinstance(ev, dec) and target_list:
                     cur_vars[target_list[0]] = ev
                 else:
