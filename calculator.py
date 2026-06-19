@@ -15,7 +15,8 @@ _LONGVAR_RE = re.compile(r'^_([A-Za-z][A-Za-z0-9]*)_$')
 
 RED    = "\x1b[38;2;255;0;0m"
 YELLOW = "\x1b[38;2;204;204;0m"
-BRBL   = "\x1b[38;2;8;91;183m"
+BRBL   = "\x1b[38;2;0;150;255m"
+LSBL   = "\x1b[38;2;94;140;255m"
 GREEN  = "\x1b[38;2;60;180;80m"
 GRAY   = "\x1b[38;2;104;104;104m"
 VIOLET = "\x1b[38;2;238;50;238m"
@@ -31,6 +32,18 @@ class Tok:
     def __repr__(self):
         return f'Tok({self.type}, {self.string!r})'
 
+class _MissingArgs:
+    __slots__ = ('lam', 'provided', 'missing')
+    def __init__(self, lam, provided: tuple, missing: list):
+        self.lam      = lam
+        self.provided = provided
+        self.missing  = missing
+    def __repr__(self):
+        names = ', '.join(_longvar_inner(p) if _is_longvar(p) else p for p in self.missing)
+        return f"{RED}Invalid syntax: missing argument(s): {names}{RST}"
+    def __str__(self):
+        return self.__repr__()
+
 class SubProxy:
     __slots__ = ('name', 'env')
     def __init__(self, name: str, env: dict):
@@ -43,6 +56,16 @@ class SubProxy:
         raise NameError(f"'{k}' is not defined")
     def __repr__(self):
         return f"SubProxy({self.name!r})"
+
+class _DisplayDec(dec):
+    def __str__(self):
+        s, d, e = self.as_tuple()
+        order = e + len(d) - 1
+        if e < 0 and abs(order) < DISPLAY_PREC:
+            return format(self, 'f')
+        return super().__str__()
+    def __repr__(self):
+        return self.__str__()
 
 
 def get_sub_specs(s: str) -> list:
@@ -281,6 +304,8 @@ class Lambda:
 
 
     def __call__(self, *args):
+        if self.params and len(args) < len(self.params):
+            return _MissingArgs(self, args, self.params[len(args):])
         v = {}
         for name, val in zip(self.params, args):
             if isinstance(val, dec):
@@ -412,6 +437,7 @@ def _repin_constants():
 
 _repin_constants()
 dco.pop('inf', None)
+dco.pop('nan', None)
 
 
 def _hydrogen_e(n):
@@ -436,7 +462,7 @@ def _solve_anharmonic(n, c):
     E, _ = mpmath.eigsy(A)
     vals  = sorted([E[i] for i in range(N)], key=lambda v: float(mpmath.re(v)))
     return dec(mpmath.nstr(vals[n], mpmath.mp.dps))
-dco['anh'] = _solve_anharmonic
+dco['anharmonic'] = _solve_anharmonic
 
 
 def _solve_schrodinger(V_expr, n, xmin, xmax, Npts=100):
@@ -696,29 +722,39 @@ def _fmt_error(msg: str) -> str:
     return f"{RED}{msg}{RST}"
 
 
-print(
-    f"  {BOLD}calc{RST}     arbitrary precision expression REPL\n\n"
-    f"  {BOLD}ops    {RST}  + − * / **\n"
-    f"  {BOLD}cmds   {RST}  help · new · toggle · img · prec <n> · clear\n"
-    f"  {BOLD}lambda {RST}  f=\"sin(x)\"   f(pi/2)   run <args>\n"
-    f"  {BOLD}diff   {RST}  diff(f)   1+diff(f)   g=diff(f,2)\n"
-    f"  {BOLD}quantum{RST}  anh(n,c) · hydrogen_e(n) · schrodinger · integrate\n"
-    f"  {BOLD}consts {RST}  e  pi  phi  euler  hbar  ·  j {GRAY}(img mode){RST}\n"
-    f"  {BOLD}vars   {RST}  single letters  ·  x=5  ·  x=y y=10\n"
-    f"  {BOLD}inline {RST}  f=\"sin(x)\"; 1+diff(f)   or   f=\"sin(x)\" 1+diff(f)\n"
-)
+print(f"""{BOLD}arbitrary precision expression REPL{RST}
+{GRAY}commands: help / new / toggle / img (activates constant j) / prec <n> / clear
+operators: + − * / **
+variables: single letters / word in underscores
+subscript: e.g. x[1] / _work_[0]
+inline: e.g. x=0 (when setting a variable) / f=\"sin(x)\"; f(x){RST}\n""")
 
 
 def _display(result: dec) -> dec:
-    quantizer = dec(10) ** -(DISPLAY_PREC - 1)
-    rounded   = result.quantize(quantizer, rounding=decimal.ROUND_HALF_EVEN)
+    if result == 0:
+        return _DisplayDec(0)
+
+    sign, digits, exponent = result.as_tuple()
+    num_digits = len(digits)
+    order = exponent + num_digits - 1
+
+    quantizer_exp = order - (DISPLAY_PREC - 1)
+    try:
+        rounded = result.quantize(dec(10) ** quantizer_exp, rounding=decimal.ROUND_HALF_EVEN)
+    except (decimal.InvalidOperation, decimal.Overflow):
+        rounded = result
+
     if rounded == 0:
-        return dec(0)
+        return _DisplayDec(0)
+
     normalized = rounded.normalize()
-    _, _, exponent = normalized.as_tuple()
-    if exponent >= 0:
-        return dec(int(normalized))
-    return normalized
+    sign2, digits2, exponent2 = normalized.as_tuple()
+    order2 = exponent2 + len(digits2) - 1
+
+    if exponent2 >= 0 and abs(order2) < DISPLAY_PREC:
+        return _DisplayDec(int(normalized))
+
+    return _DisplayDec(normalized)
 
 
 def _display_complex(result: mpmath.mpc) -> str:
@@ -742,6 +778,18 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
         tokens = get_clean_tokens(expr)
         if not tokens and expr.strip():
             return _fmt_error("The given expression has invalid syntax.")
+
+        env = {**dco, **v_dict, 'dec': dec, 'mpmath': mpmath, 'Lambda': Lambda}
+
+        for idx in range(len(tokens) - 2):
+            t0, t1, t2 = tokens[idx], tokens[idx+1], tokens[idx+2]
+            if (t0.type == tokenize.NAME and t1.type == tokenize.OP and t1.string == '('
+                    and t2.type == tokenize.OP and t2.string == ')'):
+                target = env.get(t0.string)
+                if target is not None and not callable(target):
+                    if chk: return dec(1)
+                    disp = _longvar_inner(t0.string) if _is_longvar(t0.string) else t0.string
+                    return _fmt_error(f"'{disp}' is not a function.")
 
         parts = []
         for idx, t in enumerate(tokens):
@@ -783,7 +831,6 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
                 parts.append(t.string)
 
         fin = "".join(parts)
-        env = {**dco, **v_dict, 'dec': dec, 'mpmath': mpmath, 'Lambda': Lambda}
 
         sub_bases = set()
         for k in v_dict:
@@ -798,6 +845,9 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
 
 
             if isinstance(raw, Lambda):
+                return raw
+
+            if isinstance(raw, _MissingArgs):
                 return raw
 
 
@@ -887,9 +937,15 @@ def hlp():
     avf = ", ".join(sorted([
         k + (('(' + ', '.join(str(p) for p in inspect.signature(v).parameters.values()) + ')')
              if callable(v) else '')
-        for k, v in dco.items()
+        for k, v in dco.items() if callable(v)
     ]))
-    print(f"{BRBL}Available functions & constants:\n  " + avf + RST)
+    avc = ", ".join(sorted([
+        k + (('(' + ', '.join(str(p) for p in inspect.signature(v).parameters.values()) + ')')
+             if callable(v) else '')
+        for k, v in dco.items() if not callable(v)
+    ]))
+    print(f"\n{BOLD}Available functions:{RST}\n  {BRBL}{avf}{RST}\n")
+    print(f"{BOLD}Available constants and other:{RST}\n  {BRBL}{avc}{RST}")
     print(f"""
 {BOLD}Lambda functions:{RST}
   {GREEN}f="expr"       {RST}  store a symbolic function (quoted expression).
@@ -905,7 +961,7 @@ def hlp():
   {GREEN}g=diff(f)      {RST}  store derivative as Lambda g
 
 {BOLD}Quantum / physics:{RST}
-  {GREEN}anh(n, c)      {RST}  anharmonic oscillator  H=p²/2+x²/2+c·x⁴, n-th eigenvalue
+  {GREEN}anharmonic(n, c){RST} anharmonic oscillator  H=p²/2+x²/2+c·x⁴, n-th eigenvalue
   {GREEN}hydrogen_e(n)  {RST}  hydrogen E_n = −1/(2n²) in atomic units (Hartree)
   {GREEN}schrodinger <V> <n> <xmin> <xmax> [Npts=100]{RST}
                    FD solution of [−½∂²/∂x²+V(x)]ψ=Eψ, n-th eigenvalue
@@ -1079,8 +1135,8 @@ def actions(s: str) -> bool:
     return False
 
 
-def sorta(s: str, allowed: list) -> list:
-    tokens, current, depth = [], '', 0
+def _split_top_level(s: str, sep: str) -> list:
+    parts, current, depth = [], '', 0
     in_str = False; str_char = ''
     for ch in s:
         if in_str:
@@ -1088,16 +1144,63 @@ def sorta(s: str, allowed: list) -> list:
             if ch == str_char: in_str = False
         elif ch in ('"', "'"):
             in_str = True; str_char = ch; current += ch
-        elif ch == '(':
+        elif ch in ('(', '['):
             depth += 1; current += ch
-        elif ch == ')':
+        elif ch in (')', ']'):
             depth -= 1; current += ch
-        elif ch == ' ' and depth == 0:
-            if current: tokens.append(current)
-            current = ''
+        elif ch == sep and depth == 0:
+            parts.append(current); current = ''
         else:
             current += ch
-    if current: tokens.append(current)
+    parts.append(current)
+    return parts
+
+
+def _is_assign_target(lhs: str) -> bool:
+    return ((len(lhs) == 1 and lhs.isalpha()) or
+            _is_longvar(lhs) or
+            bool(re.match(r'^[A-Za-z_][A-Za-z0-9_]*\[\d+\]$', lhs)))
+
+
+def _parse_assignment(seg: str):
+    eq = seg.find('=')
+    if eq == -1 or (eq + 1 < len(seg) and seg[eq + 1] == '='):
+        return None
+    lhs, rhs = seg[:eq].strip(), seg[eq + 1:].strip()
+    if _is_assign_target(lhs):
+        return lhs, rhs
+    return None
+
+
+def _assign_targets(inline_str: str) -> set:
+    if ';' in inline_str:
+        segs = [seg for seg in _split_top_level(inline_str, ';') if '=' in seg]
+        return {seg.split('=', 1)[0].strip() for seg in segs}
+    return {p.split('=', 1)[0].strip() for p in inline_str.split() if '=' in p}
+
+
+def sorta(s: str, allowed: list) -> list:
+    if ';' in s:
+        tokens = [seg for seg in _split_top_level(s, ';') if seg]
+    else:
+        tokens, current, depth = [], '', 0
+        in_str = False; str_char = ''
+        for ch in s:
+            if in_str:
+                current += ch
+                if ch == str_char: in_str = False
+            elif ch in ('"', "'"):
+                in_str = True; str_char = ch; current += ch
+            elif ch == '(':
+                depth += 1; current += ch
+            elif ch == ')':
+                depth -= 1; current += ch
+            elif ch == ' ' and depth == 0:
+                if current: tokens.append(current)
+                current = ''
+            else:
+                current += ch
+        if current: tokens.append(current)
 
     pairs = []
     for p in tokens:
@@ -1122,52 +1225,129 @@ def sorta(s: str, allowed: list) -> list:
 
 
 def split_inline(s: str):
-    s = s.replace(';', ' ')
-    tokens, current, depth = [], '', 0
-    in_str = False; str_char = ''
-    for ch in s:
-        if in_str:
-            current += ch
-            if ch == str_char: in_str = False
-        elif ch in ('"', "'"):
-            in_str = True; str_char = ch; current += ch
-        elif ch == '(':
-            depth += 1; current += ch
-        elif ch == ')':
-            depth -= 1; current += ch
-        elif ch == ' ' and depth == 0:
-            if current: tokens.append(current)
-            current = ''
-        else:
-            current += ch
-    if current: tokens.append(current)
+    top = _split_top_level(s, ';')
+    if len(top) > 1:
+        segments = [seg.strip() for seg in top if seg.strip()]
+        if len(segments) == 1:
+            parsed = _parse_assignment(segments[0])
+            if parsed:
+                tgt, val = parsed
+                return f"{tgt}={val};", ""
+            return "", segments[0]
+        if len(segments) >= 2:
+            *assign_segs, expr_seg = segments
+            parsed = [_parse_assignment(seg) for seg in assign_segs]
+            if all(parsed):
+                inline_str = ";".join(f"{t}={v}" for t, v in parsed) + ";"
+                return inline_str, expr_seg
+            return "", s.strip().replace(';', ' ')
 
-    def is_assign(t):
-        eq = t.find('=')
-        if eq == -1 or (eq + 1 < len(t) and t[eq + 1] == '='):
-            return False
-        lhs = t[:eq]
-        return ((len(lhs) == 1 and lhs.isalpha()) or
-                _is_longvar(lhs) or
-                bool(re.match(r'^[A-Za-z_][A-Za-z0-9_]*\[\d+\]$', lhs)))
+    s_stripped = s.strip()
+    if ' ' not in s_stripped:
+        parsed = _parse_assignment(s_stripped)
+        if parsed:
+            tgt, val = parsed
+            return f"{tgt}={val};", ""
 
-    assign_parts = [t for t in tokens if is_assign(t)]
-    expr_parts   = [t for t in tokens if not is_assign(t)]
-    return " ".join(assign_parts), " ".join(expr_parts)
+    return "", s_stripped
 
 
-def apply_inline(inline_str: str, all_vars: list, base: dict, isolate: bool) -> dict:
+def apply_inline(inline_str: str, all_vars: list, base: dict, isolate: bool, report: bool = False, protect: set = None, fixed: set = None, track_resolved: list = None, base_vals: dict = None) -> dict:
     work = base.copy() if isolate else base
     for tgt, val in sorta(inline_str, all_vars):
+        if protect and tgt in protect:
+            continue
+        if fixed is not None and tgt in fixed:
+            continue
         success = spdwarn()
         ev = cal(val, work)
         success[0] = True
+        if isinstance(ev, str) and _UNDEF_RE.search(ev):
+            prev_len = len(track_resolved) if track_resolved is not None else 0
+            ev = _resolve(val, work, track_resolved)
+            if ev is _ABORT:
+                break
+            if isinstance(ev, (dec, Lambda)) and fixed is not None:
+                fixed.add(tgt)
+            if base_vals is not None and track_resolved is not None:
+                for var in track_resolved[prev_len:]:
+                    if var in work:
+                        base_vals[var] = work[var]
         if isinstance(ev, (dec, Lambda)):
             work[tgt] = ev
-            if isinstance(ev, Lambda):                                      
+            if isinstance(ev, Lambda):
                 _user_vars[tgt] = ev
+        elif report:
+            print(ev)
     return work if isolate else base
 
+
+def _strip_spaces(s: str) -> str:
+    result = []
+    in_str = False; str_char = ''
+    for ch in s:
+        if in_str:
+            result.append(ch)
+            if ch == str_char: in_str = False
+        elif ch in ('"', "'"):
+            in_str = True; str_char = ch; result.append(ch)
+        elif ch != ' ':
+            result.append(ch)
+    return ''.join(result)
+
+
+_ABORT    = object()
+_UNDEF_RE = re.compile(r"'([^']+)' is not defined")
+
+
+def _ask_value(name, cur_vars):
+    while True:
+        disp = _longvar_inner(name) if _is_longvar(name) else name
+        inp = input(f"{BOLD}{disp}:{RST} ").strip()
+        if not inp: continue
+        if actions(inp): continue
+        if inp.lower() == 'new': return _ABORT
+        r = _resolve(inp, cur_vars)
+        if r is _ABORT or isinstance(r, (dec, Lambda)):
+            return r
+        print(r)
+
+
+def _resolve(expr_str, cur_vars, resolved=None):
+    success = spdwarn()
+    ev = cal(expr_str, cur_vars)
+    success[0] = True
+    for _ in range(20):
+        if isinstance(ev, _MissingArgs):
+            answers = []
+            for param in ev.missing:
+                if param in cur_vars and isinstance(cur_vars[param], (dec, Lambda)):
+                    val = cur_vars[param]
+                else:
+                    val = _ask_value(param, cur_vars)
+                    if val is _ABORT: return _ABORT
+                    cur_vars[param] = val
+                    if resolved is not None and param not in resolved:
+                        resolved.append(param)
+                answers.append(val)
+            success = spdwarn()
+            ev = ev.lam(*ev.provided, *answers)
+            success[0] = True
+            continue
+        if isinstance(ev, str):
+            m = _UNDEF_RE.search(ev)
+            if m:
+                val = _ask_value(m.group(1), cur_vars)
+                if val is _ABORT: return _ABORT
+                cur_vars[m.group(1)] = val
+                if resolved is not None and m.group(1) not in resolved:
+                    resolved.append(m.group(1))
+                success = spdwarn()
+                ev = cal(expr_str, cur_vars)
+                success[0] = True
+                continue
+        break
+    return ev
 
 _pending_expr: list = [None]                                                               
 
@@ -1177,69 +1357,84 @@ try:
             raw = _pending_expr[0]
             _pending_expr[0] = None
         else:
-            raw = input(f"{VIOLET}>{RST} ").strip()
+            raw = input(f"{BOLD}>{RST} ").strip()
         if actions(raw): continue
         if not raw or raw.lower() == 'new': continue
 
+        raw = _strip_spaces(raw)
         inline_str, exp = split_inline(raw)
         if not exp:
-
             if inline_str:
                 all_vars = getv(raw)
-                apply_inline(inline_str, all_vars, _user_vars, False)
-                for k, v in _user_vars.items():
-                    if isinstance(v, Lambda):
-                        print(f"  {k} = {v}")
+                prev_lambda_keys = {k for k, v in _user_vars.items() if isinstance(v, Lambda)}
+                tmp = _user_vars.copy()
+                for tgt, val in sorta(inline_str, all_vars):
+                    ev = cal(val, tmp)
+                    if isinstance(ev, Lambda):
+                        _user_vars[tgt] = ev
+                        tmp[tgt] = ev
+                new_lambdas = [(k, v) for k, v in _user_vars.items()
+                               if k not in prev_lambda_keys and isinstance(v, Lambda)]
+                for k, v in new_lambdas:
+                    print(f"  {k} = {v}")
+                if not new_lambdas:
+                    print(_fmt_error("No expression found after assignments."))
             else:
                 print(_fmt_error("No expression found after assignments."))
             continue
 
         all_vars     = getv(raw)
-        assigned_set = {p.split('=', 1)[0].strip() for p in inline_str.split() if '=' in p}
+        assigned_set = _assign_targets(inline_str)
 
         already_set  = set(_user_vars.keys())
         det_vars     = sorted(set(all_vars) - assigned_set - already_set)
 
+        cur_vars = _user_vars.copy()
+
         probe = cal(exp, {v: dec(0) for v in getv(exp)}, chk=True)
         if not isinstance(probe, dec):
-            success = spdwarn()
-            res = cal(exp, {**_user_vars, **{v: dec(0) for v in getv(exp)}})
-            success[0] = True
-            if isinstance(res, Lambda) and not assigned_set:
-                _last_lambda[0] = res
+            res = _resolve(exp, cur_vars)
+            if res is _ABORT: continue
+            if isinstance(res, Lambda) and not assigned_set: _last_lambda[0] = res
             print(res)
             continue
 
 
         cur_vars = _user_vars.copy()
 
+        resolved_names = []
+        resolved_base_vals = {}
+        fixed_inline = set()
         if inline_str:
-            cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE)
+            cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE, fixed=fixed_inline, track_resolved=resolved_names, base_vals=resolved_base_vals)
 
         broken = False
         if det_vars:
             for v in det_vars:
                 while True:
                     v_disp = _longvar_inner(v) if _is_longvar(v) else v
-                    v_inp = input(f"{VIOLET}{v_disp}:{RST} ").strip()
+                    v_inp = input(f"{BOLD}{v_disp}:{RST} ").strip()
+                    if not v_inp: continue
                     if actions(v_inp): continue
                     if v_inp.lower() == 'new': broken = True; break
-                    success = spdwarn()
-                    ev = cal(v_inp, cur_vars)
-                    success[0] = True
+                    ev = _resolve(v_inp, cur_vars)
+                    if ev is _ABORT: broken = True; break
                     if isinstance(ev, Lambda):
                         cur_vars[v] = ev
                         _user_vars[v] = ev
                     elif isinstance(ev, dec):
                         cur_vars[v] = ev
                     else:
-                        cur_vars[v] = dec(0)
+                        print(ev)
+                        continue
+                    if inline_str:
+                        cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE, fixed=fixed_inline, track_resolved=resolved_names)
                     break
                 if broken: break
             if broken: continue
 
         if inline_str:
-            cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE)
+            cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE, fixed=fixed_inline, track_resolved=resolved_names)
 
         asked_sub_keys = []
         seen_sub = set()
@@ -1250,32 +1445,29 @@ try:
             idx = int(idx_v)
             key = f"{base}[{idx}]"
             if key in seen_sub or key in cur_vars:
-                seen_sub.add(key)
-                continue
+                seen_sub.add(key); continue
             if key in _user_vars:
-                cur_vars[key] = _user_vars[key]
-                seen_sub.add(key)
-                continue
+                cur_vars[key] = _user_vars[key]; seen_sub.add(key); continue
             seen_sub.add(key)
             asked_sub_keys.append(key)
             while True:
-                v_inp = input(f"{VIOLET}{base}[{idx}]:{RST} ").strip()
+                disp = _longvar_inner(base) if _is_longvar(base) else base
+                v_inp = input(f"{BOLD}{disp}[{idx}]:{RST} ").strip()
+                if not v_inp: continue
                 if actions(v_inp): continue
                 if v_inp.lower() == 'new': broken = True; break
-                success = spdwarn()
-                ev = cal(v_inp, cur_vars)
-                success[0] = True
+                ev = _resolve(v_inp, cur_vars)
+                if ev is _ABORT: broken = True; break
                 cur_vars[key] = ev if isinstance(ev, dec) else dec(0)
                 break
             if broken: break
         if broken: continue
 
         if inline_str:
-            cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE)
+            cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE, fixed=fixed_inline, track_resolved=resolved_names)
 
-        success = spdwarn()
-        res = cal(exp, cur_vars)
-        success[0] = True
+        res = _resolve(exp, cur_vars, resolved_names)
+        if res is _ABORT: continue
         if isinstance(res, Lambda) and not assigned_set: _last_lambda[0] = res
         print(res)
 
@@ -1288,48 +1480,60 @@ try:
             if actions(inp): continue
             if inp.lower() == 'new': break
             if not inp:
-                success = spdwarn()
-                res = cal(exp, cur_vars)
-                success[0] = True
+                res = _resolve(exp, cur_vars, resolved_names)
+                if res is _ABORT: break
                 if isinstance(res, Lambda) and not assigned_set: _last_lambda[0] = res
                 print(res); continue
 
+            inp = _strip_spaces(inp)
+            just_set = set()
+            user_updated = set()
             if '=' in inp:
-                assigns = sorta(inp, all_vars)
+                assigns = sorta(inp, list(dict.fromkeys(all_vars + resolved_names)))
                 if not assigns: continue
-                err = False; tmp = cur_vars.copy()
-                success = spdwarn()
+                err = False; abort = False; tmp = cur_vars.copy()
                 for tgt, val in assigns:
-                    ev = cal(val, tmp)
+                    ev = _resolve(val, tmp, resolved_names)
+                    if ev is _ABORT:
+                        abort = True; break
                     if isinstance(ev, (dec, Lambda)):
                         tmp[tgt] = ev
                         if isinstance(ev, Lambda): _user_vars[tgt] = ev
                     else:
                         print(ev); err = True; break
-                success[0] = True
+                if abort: break
                 if err: continue
+                just_set = {tgt for tgt, _ in assigns}
+                user_updated = just_set.copy()
                 cur_vars = tmp
             else:
-                success = spdwarn()
-                ev = cal(inp, cur_vars)
-                success[0] = True
+                ev = _resolve(inp, cur_vars, resolved_names)
+                if ev is _ABORT: break
                 if isinstance(ev, Lambda):
                     print(ev)
                     continue
-                target_list = det_vars if det_vars else asked_sub_keys if asked_sub_keys else sorted(set(all_vars) - already_set - assigned_set)
+                target_list = det_vars if det_vars else (asked_sub_keys + resolved_names) if (asked_sub_keys or resolved_names) else sorted(set(all_vars) - already_set - assigned_set)
                 if isinstance(ev, dec) and target_list:
-                    cur_vars[target_list[0]] = ev
+                    cur_vars[target_list[-1]] = ev
+                    user_updated = {target_list[-1]}
+                elif isinstance(ev, dec):
+                    print(ev)
+                    continue
+                elif isinstance(ev, str):
+                    print(ev)
+                    continue
                 else:
-
                     _pending_expr[0] = inp
                     break
 
             if inline_str:
-                cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE)
+                for k, v in resolved_base_vals.items():
+                    if k not in user_updated:
+                        cur_vars[k] = v
+                cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE, protect=just_set)
 
-            success = spdwarn()
-            res = cal(exp, cur_vars)
-            success[0] = True
+            res = _resolve(exp, cur_vars, resolved_names)
+            if res is _ABORT: break
             if isinstance(res, Lambda) and not assigned_set: _last_lambda[0] = res
             print(res)
 except EOFError:
