@@ -1,4 +1,4 @@
-import ast, math, tokenize, io, decimal, inspect, mpmath, re
+import ast, tokenize, io, decimal, inspect, mpmath, re
 threading = None
 time      = None
 
@@ -445,7 +445,8 @@ def _round(x, n=dec(0)):
 
 dco['int']    = _int
 dco['round']  = _round
-dco['rad']    = dco.pop('radians')
+dco['rad']    = dco['radians']
+dco['deg']    = dco['degrees']
 dco['repeat'] = lambda *_: _fmt_error("repeat() must be a top-level call: repeat(expr, n)")
 dco['true']   = True
 dco['false']  = False
