@@ -11,7 +11,6 @@ mpmath.mp.dps = 55
 ISO_INLINE   = True
 GUARD_DIGITS = 20
 IMG          = False
-_LONGVAR_RE = re.compile(r'^_([A-Za-z][A-Za-z0-9]*)_$')
 
 RED    = "\x1b[38;2;255;0;0m"
 YELLOW = "\x1b[38;2;204;204;0m"
@@ -20,6 +19,7 @@ LSBL   = "\x1b[38;2;94;140;255m"
 GREEN  = "\x1b[38;2;60;180;80m"
 GRAY   = "\x1b[38;2;104;104;104m"
 VIOLET = "\x1b[38;2;238;50;238m"
+WHITE  = "\x1b[38;2;250;250;250m"
 BOLD   = "\x1b[1m"
 RST    = "\x1b[0m"
 
@@ -97,11 +97,39 @@ def get_sub_specs(s: str) -> list:
         i += 1
     return specs
 
+_lv_to_mangled = {}
+_mangled_to_lv = {}
+
+def _register_longvar(inner: str) -> str:
+    if inner not in _lv_to_mangled:
+        n   = len(_lv_to_mangled)
+        m   = f"XLONGx{n}x"
+        _lv_to_mangled[inner] = m
+        _mangled_to_lv[m]     = inner
+    return _lv_to_mangled[inner]
+
 def _is_longvar(s: str) -> bool:
-    return bool(_LONGVAR_RE.match(s))
+    return s in _mangled_to_lv
 
 def _longvar_inner(s: str) -> str:
-    return s[1:-1]
+    return _mangled_to_lv.get(s, s)
+
+def _preprocess_lv(s: str) -> str:
+    buf = []
+    i = 0
+    while i < len(s):
+        if s[i] == '_':
+            j = s.find('_', i + 1)
+            if j > i:
+                buf.append(_register_longvar(s[i+1:j]))
+                i = j + 1
+            else:
+                buf.append('_')
+                i += 1
+        else:
+            buf.append(s[i])
+            i += 1
+    return re.sub(r'(XLONGx\d+x)(\d)', r'\1*\2', ''.join(buf))
 
 def _split_alnum(s: str) -> list:
     raw_segs = []
@@ -167,6 +195,7 @@ def _should_split(name: str) -> bool:
 _TOK_STRING = 200                                              
 
 def get_clean_tokens(s: str) -> list:
+    s = _preprocess_lv(s)
     s = re.sub(r'(\d)(_[A-Za-z])', r'\1 \2', s)
     raw_tokens = []
     try:
@@ -722,12 +751,12 @@ def _fmt_error(msg: str) -> str:
     return f"{RED}{msg}{RST}"
 
 
-print(f"""{BOLD}arbitrary precision expression REPL{RST}
-{GRAY}commands: help / new / toggle / img (activates constant j) / prec <n> / clear
-operators: + − * / **
-variables: single letters / word in underscores
-subscript: e.g. x[1] / _work_[0]
-inline: e.g. x=0 (when setting a variable) / f=\"sin(x)\"; f(x){RST}\n""")
+print(f"""Arbitrary-precision mathematical expression REPL.
+{GRAY}Commands: help / new / toggle / img (activates constant j) / prec <n> / clear
+Operators: + − * / **
+Variables: single letters / word in underscores
+Subscript: e.g. x[1] / _work_[0]
+Inline: e.g. x=0 (when setting a variable) / f=\"sin(x)\"; f(rad(x)){RST}\n""")
 
 
 def _display(result: dec) -> dec:
@@ -1283,17 +1312,32 @@ def apply_inline(inline_str: str, all_vars: list, base: dict, isolate: bool, rep
 
 
 def _strip_spaces(s: str) -> str:
-    result = []
+    buf = []
     in_str = False; str_char = ''
-    for ch in s:
+    i = 0
+    while i < len(s):
+        ch = s[i]
         if in_str:
-            result.append(ch)
+            buf.append(ch)
             if ch == str_char: in_str = False
+            i += 1
         elif ch in ('"', "'"):
-            in_str = True; str_char = ch; result.append(ch)
+            in_str = True; str_char = ch; buf.append(ch)
+            i += 1
+        elif ch == '_':
+            j = s.find('_', i + 1)
+            if j > i:
+                buf.append(_register_longvar(s[i+1:j]))
+                i = j + 1
+            else:
+                buf.append('_')
+                i += 1
         elif ch != ' ':
-            result.append(ch)
-    return ''.join(result)
+            buf.append(ch)
+            i += 1
+        else:
+            i += 1
+    return re.sub(r'(XLONGx\d+x)(\d)', r'\1*\2', ''.join(buf))
 
 
 _ABORT    = object()
@@ -1376,7 +1420,8 @@ try:
                 new_lambdas = [(k, v) for k, v in _user_vars.items()
                                if k not in prev_lambda_keys and isinstance(v, Lambda)]
                 for k, v in new_lambdas:
-                    print(f"  {k} = {v}")
+                    disp_k = _longvar_inner(k) if _is_longvar(k) else k
+                    print(f"  {disp_k} = {v}")
                 if not new_lambdas:
                     print(_fmt_error("No expression found after assignments."))
             else:
@@ -1472,9 +1517,10 @@ try:
         print(res)
 
 
-        if not all_vars and not asked_sub_keys:
+        if not det_vars and not resolved_names and not asked_sub_keys:
             continue
-
+        
+        user_pinned = set()
         while True:
             inp = input().strip()
             if actions(inp): continue
@@ -1505,6 +1551,7 @@ try:
                 if err: continue
                 just_set = {tgt for tgt, _ in assigns}
                 user_updated = just_set.copy()
+                user_pinned |= just_set
                 cur_vars = tmp
             else:
                 ev = _resolve(inp, cur_vars, resolved_names)
@@ -1528,9 +1575,9 @@ try:
 
             if inline_str:
                 for k, v in resolved_base_vals.items():
-                    if k not in user_updated:
+                    if k not in user_updated and k not in user_pinned:
                         cur_vars[k] = v
-                cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE, protect=just_set)
+                cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE, protect=just_set | user_pinned)
 
             res = _resolve(exp, cur_vars, resolved_names)
             if res is _ABORT: break
