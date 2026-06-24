@@ -10,7 +10,7 @@ mpmath.mp.dps = 55
 
 ISO_INLINE   = True
 GUARD_DIGITS = 20
-IMG          = False
+IMG          = True
 
 RED    = "\x1b[38;2;255;0;0m"
 YELLOW = "\x1b[38;2;204;204;0m"
@@ -238,6 +238,19 @@ def get_clean_tokens(s: str) -> list:
     except tokenize.TokenError:
         pass
 
+    expanded = []
+    for idx, tok in enumerate(raw_tokens):
+        if (tok.type == tokenize.NAME and
+                tok.string in dco and
+                callable(dco[tok.string]) and
+                not _is_longvar(tok.string) and
+                (idx + 1 >= len(raw_tokens) or raw_tokens[idx + 1].string != '(')):
+            for ch in tok.string:
+                expanded.append(Tok(tokenize.NAME, ch))
+        else:
+            expanded.append(tok)
+    raw_tokens = expanded
+
     merged = []
     i = 0
     while i < len(raw_tokens):
@@ -265,7 +278,8 @@ def get_clean_tokens(s: str) -> list:
 
 
 def getv(s: str) -> list:
-    found  = set()
+    seen = []
+    found = set()
     tokens = get_clean_tokens(s)
     i = 0
     while i < len(tokens):
@@ -284,17 +298,19 @@ def getv(s: str) -> list:
                     j += 1
                 for it in tokens[i+2:j]:
                     if it.type == tokenize.NAME:
-                        if (len(it.string) == 1 and it.string not in dco) or _is_longvar(it.string):
-                            found.add(it.string)
+                        if ((len(it.string) == 1 and it.string not in dco) or _is_longvar(it.string)) and it.string not in found:
+                            found.add(it.string); seen.append(it.string)
                 i = j + 1
                 continue
             elif (len(t.string) == 1 and t.string not in dco) or _is_longvar(t.string):
-                found.add(t.string)
+                if t.string not in found:
+                    found.add(t.string); seen.append(t.string)
         i += 1
-    return sorted(found)
+    return seen
 
 def _get_lambda_params(expr: str) -> list:
-    found  = set()
+    seen = []
+    found = set()
     tokens = get_clean_tokens(expr)
     i = 0
     while i < len(tokens):
@@ -314,16 +330,19 @@ def _get_lambda_params(expr: str) -> list:
                 idx_toks = tokens[i+2:j]
                 for it in idx_toks:
                     if it.type == tokenize.NAME:
-                        if (len(it.string) == 1 and it.string not in dco) or _is_longvar(it.string):
-                            found.add(it.string)
+                        if ((len(it.string) == 1 and it.string not in dco) or _is_longvar(it.string)) and it.string not in found:
+                            found.add(it.string); seen.append(it.string)
                 if len(idx_toks) == 1 and idx_toks[0].type == tokenize.NUMBER:
-                    found.add(f"{t.string}[{idx_toks[0].string}]")
+                    k = f"{t.string}[{idx_toks[0].string}]"
+                    if k not in found:
+                        found.add(k); seen.append(k)
                 i = j + 1
                 continue
             elif (len(t.string) == 1 and t.string not in dco) or _is_longvar(t.string):
-                found.add(t.string)
+                if t.string not in found:
+                    found.add(t.string); seen.append(t.string)
         i += 1
-    return sorted(found)
+    return seen
 
 
 class Lambda:
@@ -448,11 +467,9 @@ dco['round']  = _round
 dco['rad']    = dco['radians']
 dco['deg']    = dco['degrees']
 dco['repeat'] = lambda *_: _fmt_error("repeat() must be a top-level call: repeat(expr, n)")
-dco['true']   = True
-dco['false']  = False
-
-if IMG:
-    dco['j'] = mpmath.mpc(0, 1)
+dco['mpf'] = lambda x: mpmath.mpf(str(x))
+dco['mpc'] = lambda r, i: mpmath.mpc(str(r), str(i))
+dco['i'] = mpmath.mpc(0, 1)
 
 
 def _to_dec(v):
@@ -466,8 +483,6 @@ def _repin_constants():
     dco['hbar']  = dec('1')
 
 _repin_constants()
-dco.pop('inf', None)
-dco.pop('nan', None)
 
 
 def _hydrogen_e(n):
@@ -753,7 +768,7 @@ def _fmt_error(msg: str) -> str:
 
 
 print(f"""Arbitrary-precision mathematical expression REPL.
-{GRAY}Commands: help / new / toggle / img (activates constant j) / prec <n> / clear
+{GRAY}Commands: help / new / toggle / img (toggles complex mode, on by default) / prec <n> / clear
 Operators: + − * / **
 Variables: single letters / word in underscores
 Subscript: e.g. x[1] / _work_[0]
@@ -761,6 +776,8 @@ Inline: e.g. x=0 (when setting a variable) / f=\"sin(x)\"; f(rad(x)){RST}\n""")
 
 
 def _display(result: dec) -> dec:
+    if result.is_infinite() or result.is_nan():
+        return result
     if result == 0:
         return _DisplayDec(0)
 
@@ -788,13 +805,20 @@ def _display(result: dec) -> dec:
 
 
 def _display_complex(result: mpmath.mpc) -> str:
-    re     = _display(dec(mpmath.nstr(result.real, mpmath.mp.dps)))
-    im_raw = dec(mpmath.nstr(result.imag, mpmath.mp.dps))
-    im     = _display(abs(im_raw))
-    if re == 0:
-        return f"-{im}j" if im_raw < 0 else f"{im}j"
-    sign = '+' if im_raw >= 0 else '-'
-    return f"{re}{sign}{im}j"
+    re_part = _display(dec(mpmath.nstr(result.real, mpmath.mp.dps)))
+    im_raw  = dec(mpmath.nstr(result.imag, mpmath.mp.dps))
+    im      = _display(abs(im_raw))
+    im_str  = '' if im == 1 else str(im)
+    if re_part == 0:
+        return f"-{im_str}i" if im_raw < 0 else f"{im_str}i"
+    sign = '-' if im_raw < 0 else '+'
+    return f"{re_part}{sign}{im_str}i"
+
+
+def _fmt_result(v):
+    if isinstance(v, mpmath.mpc):
+        return _display_complex(v)
+    return str(v)
 
 
 def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = False):
@@ -809,7 +833,7 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
         if not tokens and expr.strip():
             return _fmt_error("The given expression has invalid syntax.")
 
-        env = {**dco, **v_dict, 'dec': dec, 'mpmath': mpmath, 'Lambda': Lambda}
+        env = {**dco, **{k: (dec(v) if isinstance(v, _DisplayDec) else v) for k, v in v_dict.items()}, 'dec': dec, 'mpmath': mpmath, 'Lambda': Lambda}
 
         for idx in range(len(tokens) - 2):
             t0, t1, t2 = tokens[idx], tokens[idx+1], tokens[idx+2]
@@ -889,13 +913,26 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
                     return dec(1)
                 if not IMG:
                     return _fmt_error("No real solutions.")
-                return _display_complex(raw)
+                return raw
 
 
             if isinstance(raw, mpmath.mpf):
+                if mpmath.isinf(raw):
+                    if chk: return dec(1)
+                    return _fmt_error("Result infinite (positive)." if raw > 0 else "Result infinite (negative).")
+                if mpmath.isnan(raw):
+                    if chk: return dec(1)
+                    return _fmt_error("Result not a number.")
                 raw = dec(mpmath.nstr(raw, mpmath.mp.dps))
             elif not isinstance(raw, dec):
                 raw = dec(str(raw))
+            if isinstance(raw, dec):
+                if raw.is_infinite():
+                    if chk: return dec(1)
+                    return _fmt_error("Result infinite (positive)." if raw > 0 else "Result infinite (negative).")
+                if raw.is_nan():
+                    if chk: return dec(1)
+                    return _fmt_error("Result not a number.")
             return raw if nodisplay else _display(raw)
 
         except SyntaxError:
@@ -1124,13 +1161,14 @@ def actions(s: str) -> bool:
 
     if cmd == 'clear':
         _user_vars.clear()
-        print(f"\x1b[32mPersistent variables cleared.{RST}")
+        _last_lambda[0] = None
+        print(f"\x1b[32mAll variables and functions cleared.{RST}")
         return True
 
     if cmd == 'img':
         IMG = not IMG
-        if IMG: dco['j'] = mpmath.mpc(0, 1)
-        else:   dco.pop('j', None)
+        if IMG: dco['i'] = mpmath.mpc(0, 1)
+        else:   dco.pop('i', None)
         print(f"\x1b[32mImaginary mode: {'ON' if IMG else 'OFF'}{RST}")
         return True
 
@@ -1303,7 +1341,7 @@ def apply_inline(inline_str: str, all_vars: list, base: dict, isolate: bool, rep
                 for var in track_resolved[prev_len:]:
                     if var in work:
                         base_vals[var] = work[var]
-        if isinstance(ev, (dec, Lambda)):
+        if isinstance(ev, (dec, Lambda, mpmath.mpc)):
             work[tgt] = ev
             if isinstance(ev, Lambda):
                 _user_vars[tgt] = ev
@@ -1353,7 +1391,7 @@ def _ask_value(name, cur_vars):
         if actions(inp): continue
         if inp.lower() == 'new': return _ABORT
         r = _resolve(inp, cur_vars)
-        if r is _ABORT or isinstance(r, (dec, Lambda)):
+        if r is _ABORT or isinstance(r, (dec, Lambda, mpmath.mpc)):
             return r
         print(r)
 
@@ -1366,7 +1404,7 @@ def _resolve(expr_str, cur_vars, resolved=None):
         if isinstance(ev, _MissingArgs):
             answers = []
             for param in ev.missing:
-                if param in cur_vars and isinstance(cur_vars[param], (dec, Lambda)):
+                if param in cur_vars and isinstance(cur_vars[param], (dec, Lambda, mpmath.mpc)):
                     val = cur_vars[param]
                 else:
                     val = _ask_value(param, cur_vars)
@@ -1433,7 +1471,7 @@ try:
         assigned_set = _assign_targets(inline_str)
 
         already_set  = set(_user_vars.keys())
-        det_vars     = sorted(set(all_vars) - assigned_set - already_set)
+        det_vars     = [v for v in all_vars if v not in assigned_set and v not in already_set]
 
         cur_vars = _user_vars.copy()
 
@@ -1442,7 +1480,7 @@ try:
             res = _resolve(exp, cur_vars)
             if res is _ABORT: continue
             if isinstance(res, Lambda) and not assigned_set: _last_lambda[0] = res
-            print(res)
+            print(_fmt_result(res))
             continue
 
 
@@ -1457,6 +1495,8 @@ try:
         broken = False
         if det_vars:
             for v in det_vars:
+                if v in cur_vars:
+                    continue
                 while True:
                     v_disp = _longvar_inner(v) if _is_longvar(v) else v
                     v_inp = input(f"{BOLD}{v_disp}:{RST} ").strip()
@@ -1468,7 +1508,7 @@ try:
                     if isinstance(ev, Lambda):
                         cur_vars[v] = ev
                         _user_vars[v] = ev
-                    elif isinstance(ev, dec):
+                    elif isinstance(ev, (dec, mpmath.mpc)):
                         cur_vars[v] = ev
                     else:
                         print(ev)
@@ -1515,7 +1555,7 @@ try:
         res = _resolve(exp, cur_vars, resolved_names)
         if res is _ABORT: continue
         if isinstance(res, Lambda) and not assigned_set: _last_lambda[0] = res
-        print(res)
+        print(_fmt_result(res))
 
 
         if not det_vars and not resolved_names and not asked_sub_keys:
@@ -1530,7 +1570,7 @@ try:
                 res = _resolve(exp, cur_vars, resolved_names)
                 if res is _ABORT: break
                 if isinstance(res, Lambda) and not assigned_set: _last_lambda[0] = res
-                print(res); continue
+                print(_fmt_result(res)); continue
 
             inp = _strip_spaces(inp)
             just_set = set()
@@ -1543,7 +1583,7 @@ try:
                     ev = _resolve(val, tmp, resolved_names)
                     if ev is _ABORT:
                         abort = True; break
-                    if isinstance(ev, (dec, Lambda)):
+                    if isinstance(ev, (dec, Lambda, mpmath.mpc)):
                         tmp[tgt] = ev
                         if isinstance(ev, Lambda): _user_vars[tgt] = ev
                     else:
@@ -1557,15 +1597,12 @@ try:
             else:
                 ev = _resolve(inp, cur_vars, resolved_names)
                 if ev is _ABORT: break
-                if isinstance(ev, Lambda):
-                    print(ev)
-                    continue
-                target_list = det_vars if det_vars else (asked_sub_keys + resolved_names) if (asked_sub_keys or resolved_names) else sorted(set(all_vars) - already_set - assigned_set)
-                if isinstance(ev, dec) and target_list:
+                target_list = det_vars if det_vars else (asked_sub_keys + resolved_names) if (asked_sub_keys or resolved_names) else [v for v in all_vars if v not in already_set and v not in assigned_set]
+                if isinstance(ev, (dec, mpmath.mpc, Lambda)) and target_list:
                     cur_vars[target_list[-1]] = ev
                     user_updated = {target_list[-1]}
-                elif isinstance(ev, dec):
-                    print(ev)
+                elif isinstance(ev, (dec, mpmath.mpc, Lambda)):
+                    print(_fmt_result(ev))
                     continue
                 elif isinstance(ev, str):
                     print(ev)
@@ -1583,7 +1620,7 @@ try:
             res = _resolve(exp, cur_vars, resolved_names)
             if res is _ABORT: break
             if isinstance(res, Lambda) and not assigned_set: _last_lambda[0] = res
-            print(res)
+            print(_fmt_result(res))
 except EOFError:
     print("(Quit)")
     exit()
