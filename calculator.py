@@ -1440,7 +1440,7 @@ try:
             raw = _pending_expr[0]
             _pending_expr[0] = None
         else:
-            raw = input(f"{BOLD}>{RST} ").strip()
+            raw = input(f"{BOLD}>>{RST} ").strip()
         if actions(raw): continue
         if not raw or raw.lower() == 'new': continue
 
@@ -1563,7 +1563,7 @@ try:
         
         user_pinned = set()
         while True:
-            inp = input().strip()
+            inp = input(f"{BOLD}>{RST} ").strip()
             if actions(inp): continue
             if inp.lower() == 'new': break
             if not inp:
