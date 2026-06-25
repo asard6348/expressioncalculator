@@ -702,13 +702,13 @@ def _symbolic_diff(expr_str: str, var: str, order: int = 1) -> str:
         ast.fix_missing_locations(node)
         return ast.unparse(node)
     except Exception as err:
-        return f"\x1b[38;2;255;0;0mSymbolic diff error: {err}\x1b[0m"
+        return _fmt_error(f"Symbolic diff error: {err}")
 
 
 def _diff_lambda(f, order=None):
     if not isinstance(f, Lambda):
         return _fmt_error("diff() expects a Lambda (quoted expression).  "
-                          "Example:  f=\"sin(x)\"  then  diff(f)")
+                          "Example: diff(\"sin(x)\")")
     if not f.params:
         return Lambda("0", [])
     var    = f.params[0]
@@ -768,7 +768,7 @@ def _fmt_error(msg: str) -> str:
 
 
 print(f"""Arbitrary-precision mathematical expression REPL.
-{GRAY}Commands: help / new / toggle / img (toggles complex mode, on by default) / prec <n> / clear
+{GRAY}Commands: help / new (or Ctrl+C/D) / toggle / img (use constant i) / prec <n> / clear
 Operators: + − * / **
 Variables: single letters / word in underscores
 Subscript: e.g. x[1] / _work_[0]
@@ -904,6 +904,9 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
             if isinstance(raw, _MissingArgs):
                 return raw
 
+            if isinstance(raw, str):
+                return raw
+
 
             if isinstance(raw, mpmath.mpc):
                 im = dec(mpmath.nstr(raw.imag, mpmath.mp.dps))
@@ -950,9 +953,12 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
         except decimal.Overflow:
             if chk: return dec(1)
             return _fmt_error("Result too large.")
-        except (decimal.InvalidOperation, ValueError, OverflowError):
+        except (decimal.InvalidOperation, ValueError):
             if chk: return dec(1)
-            return _fmt_error("No real solutions.")
+            return _fmt_error("Invalid operation from input.")
+        except OverflowError:
+            if chk: return dec(1)
+            return _fmt_error("Numerical overflow.")
         except Exception:
             if chk: return dec(1)
             raise
@@ -1052,13 +1058,17 @@ def _do_schrodinger(raw: str) -> bool:
         print(_fmt_error("Usage: schrodinger <V_expr> <n> <xmin> <xmax> [Npts=100]"))
         return True
     V_expr = parts[1]
-    try:
-        n_v = cal(parts[2], {}); xmin_v = cal(parts[3], {}); xmax_v = cal(parts[4], {})
-    except Exception as err:
-        print(_fmt_error(f"Argument error: {err}")); return True
+    n_v    = _eval_arg(parts[2])
+    xmin_v = _eval_arg(parts[3])
+    xmax_v = _eval_arg(parts[4])
     for lbl, v in [('n', n_v), ('xmin', xmin_v), ('xmax', xmax_v)]:
+        if v is _ABORT: return True
         if not isinstance(v, dec): print(v); return True
-    Npts = int(cal(parts[5], {})) if len(parts) >= 6 else 100
+    Npts = 100
+    if len(parts) >= 6:
+        nv = _eval_arg(parts[5])
+        if nv is _ABORT: return True
+        if isinstance(nv, dec): Npts = int(nv)
     success = spdwarn()
     print(_solve_schrodinger(V_expr, int(n_v), xmin_v, xmax_v, Npts))
     success[0] = True
@@ -1076,7 +1086,8 @@ def _do_integrate(raw: str) -> bool:
         sl = s.lower()
         if sl in ('inf', '+inf'):  return  mpmath.inf
         if sl == '-inf':           return -mpmath.inf
-        v = cal(s, {})
+        v = _eval_arg(s)
+        if v is _ABORT: return None
         return mpmath.mpf(str(v)) if isinstance(v, dec) else None
 
     a_mp, b_mp = _lim(a_str), _lim(b_str)
@@ -1128,8 +1139,9 @@ def _do_run(raw: str) -> bool:
 
     args_vals = []
     for a in args_str:
-        v = cal(a, _user_vars)
-        if not isinstance(v, dec):
+        v = _eval_arg(a)
+        if v is _ABORT: return True
+        if not isinstance(v, (dec, mpmath.mpc)):
             print(v); return True
         args_vals.append(v)
 
@@ -1177,9 +1189,14 @@ def actions(s: str) -> bool:
         if len(parts) == 1:
             print(f"\x1b[32mDisplay: {DISPLAY_PREC} digits  (internal: {ctx.prec}){RST}")
             return True
-        if len(parts) == 2:
-            try: n = int(parts[1])
-            except ValueError:
+        if len(parts) >= 2:
+            ev = _eval_arg(' '.join(raw.strip().split()[1:]))
+            if ev is _ABORT: return True
+            if not isinstance(ev, dec):
+                print(ev if isinstance(ev, str) else _fmt_error("prec: numeric value required"))
+                return True
+            try: n = int(ev)
+            except Exception:
                 print(_fmt_error("prec: integer required")); return True
             if n < 1:
                 print(_fmt_error("prec: must be ≥ 1")); return True
@@ -1386,7 +1403,11 @@ _UNDEF_RE = re.compile(r"'([^']+)' is not defined")
 def _ask_value(name, cur_vars):
     while True:
         disp = _longvar_inner(name) if _is_longvar(name) else name
-        inp = input(f"{BOLD}{disp}:{RST} ").strip()
+        try:
+            inp = input(f"{BOLD}{disp}:{RST} ").strip()
+        except KeyboardInterrupt:
+            print()
+            return _ABORT
         if not inp: continue
         if actions(inp): continue
         if inp.lower() == 'new': return _ABORT
@@ -1431,6 +1452,10 @@ def _resolve(expr_str, cur_vars, resolved=None):
                 continue
         break
     return ev
+
+def _eval_arg(s: str):
+    cur = _user_vars.copy()
+    return _resolve(_strip_spaces(s), cur)
 
 _pending_expr: list = [None]                                                               
 
@@ -1499,7 +1524,11 @@ try:
                     continue
                 while True:
                     v_disp = _longvar_inner(v) if _is_longvar(v) else v
-                    v_inp = input(f"{BOLD}{v_disp}:{RST} ").strip()
+                    try:
+                        v_inp = input(f"{BOLD}{v_disp}:{RST} ").strip()
+                    except KeyboardInterrupt:
+                        print()
+                        broken = True; break
                     if not v_inp: continue
                     if actions(v_inp): continue
                     if v_inp.lower() == 'new': broken = True; break
@@ -1538,7 +1567,11 @@ try:
             asked_sub_keys.append(key)
             while True:
                 disp = _longvar_inner(base) if _is_longvar(base) else base
-                v_inp = input(f"{BOLD}{disp}[{idx}]:{RST} ").strip()
+                try:
+                    v_inp = input(f"{BOLD}{disp}[{idx}]:{RST} ").strip()
+                except KeyboardInterrupt:
+                    print()
+                    broken = True; break
                 if not v_inp: continue
                 if actions(v_inp): continue
                 if v_inp.lower() == 'new': broken = True; break
@@ -1563,7 +1596,11 @@ try:
         
         user_pinned = set()
         while True:
-            inp = input(f"{BOLD}>{RST} ").strip()
+            try:
+                inp = input(f"{BOLD}>{RST} ").strip()
+            except KeyboardInterrupt:
+                print()
+                break
             if actions(inp): continue
             if inp.lower() == 'new': break
             if not inp:
