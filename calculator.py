@@ -407,10 +407,10 @@ dco = {
 }
 
 
-def spdwarn():
+def run(func, *args, **kwargs):
     global threading, time
-    canwrn  = False
     success = [False]
+    canwrn = False
     if threading is None or time is None:
         try:
             import threading as thr, time as tim
@@ -423,7 +423,14 @@ def spdwarn():
             if not suc[0]:
                 print(f"{YELLOW}Speed tip: install gmpy2{RST}")
         threading.Thread(target=wrn, args=(success,), daemon=True).start()
-    return success
+    try:
+        result = func(*args, **kwargs)
+        success[0] = True
+        return result
+    except KeyboardInterrupt:
+        success[0] = True
+        print(f"{YELLOW}Interrupted.{RST}")
+        return _ABORT
 
 
 def _make_wrapper(func):
@@ -991,18 +998,13 @@ def _eval_repeat(expr: str, v_dict: dict, chk: bool = False):
     n_val = cal(n_str, v_dict, chk)
     if not isinstance(n_val, dec): return n_val
     try:
-        n = int(n_val)
-    except Exception:
-        return _fmt_error("repeat() count must be a whole number.")
-    if n <= 0: return _fmt_error("repeat() count must be positive.")
-    vars_in = getv(inner_expr)
-    target  = vars_in[0] if vars_in else None
-    result  = dec(0)
-    work    = v_dict
-    for _ in range(n):
-        result = cal(inner_expr, work, chk)
-        if not isinstance(result, dec): return result
-        if target is not None: work[target] = result
+        for _ in range(n):
+            result = cal(inner_expr, work, chk)
+            if not isinstance(result, dec): return result
+            if target is not None: work[target] = result
+    except KeyboardInterrupt:
+        print(f"\n{YELLOW}Interrupted.{RST}")
+        return _ABORT
     return result
 
 
@@ -1069,9 +1071,8 @@ def _do_schrodinger(raw: str) -> bool:
         nv = _eval_arg(parts[5])
         if nv is _ABORT: return True
         if isinstance(nv, dec): Npts = int(nv)
-    success = spdwarn()
-    print(_solve_schrodinger(V_expr, int(n_v), xmin_v, xmax_v, Npts))
-    success[0] = True
+    res = run(_solve_schrodinger, V_expr, int(n_v), xmin_v, xmax_v, Npts)
+    if res is not _ABORT: print(res)
     return True
 
 
@@ -1096,16 +1097,14 @@ def _do_integrate(raw: str) -> bool:
 
     def integrand(t): return _cal_mpf(expr_str, var, t)
 
-    success = spdwarn()
     try:
-        result     = mpmath.quad(integrand, [a_mp, b_mp])
-        success[0] = True
+        result = run(mpmath.quad, integrand, [a_mp, b_mp])
+        if result is _ABORT: return True
         result_dec = dec(mpmath.nstr(result, mpmath.mp.dps))
         if abs(result_dec) < dec('1e-' + str(ctx.prec - 2)):
             result_dec = dec(0)
         print(_display(result_dec))
     except Exception as err:
-        success[0] = True
         print(_fmt_error(f"Integration failed: {err}"))
     return True
 
@@ -1146,15 +1145,15 @@ def _do_run(raw: str) -> bool:
         args_vals.append(v)
 
     call_args = [args_vals[i % len(args_vals)] for i in range(len(lam.params))]
-    result    = lam(*call_args)
-
+    result = run(lam, *call_args)
+    if result is _ABORT: return True
     if isinstance(result, dec):
         print(_display(result))
     elif isinstance(result, Lambda):
         _last_lambda[0] = result
         print(result)
     else:
-        print(result)
+        print(_fmt_result(result))
     return True
 
 
@@ -1200,10 +1199,19 @@ def actions(s: str) -> bool:
                 print(_fmt_error("prec: integer required")); return True
             if n < 1:
                 print(_fmt_error("prec: must be ≥ 1")); return True
+            old_dp = DISPLAY_PREC
+            old_cp = ctx.prec
+            old_md = mpmath.mp.dps
             DISPLAY_PREC  = n
             ctx.prec      = n + GUARD_DIGITS
             mpmath.mp.dps = n + GUARD_DIGITS + 5
-            success = spdwarn(); _repin_constants(); success[0] = True
+            result = run(_repin_constants)
+            if result is _ABORT:
+                DISPLAY_PREC  = old_dp
+                ctx.prec      = old_cp
+                mpmath.mp.dps = old_md
+                _repin_constants()
+                return True
             print(f"\x1b[32mPrecision → {DISPLAY_PREC} display  ({ctx.prec} internal){RST}")
             return True
         print(_fmt_error("Usage: prec  or  prec <n>")); return True
@@ -1344,9 +1352,8 @@ def apply_inline(inline_str: str, all_vars: list, base: dict, isolate: bool, rep
             continue
         if fixed is not None and tgt in fixed:
             continue
-        success = spdwarn()
-        ev = cal(val, work)
-        success[0] = True
+        ev = run(cal, val, work)
+        if ev is _ABORT: break
         if isinstance(ev, str) and _UNDEF_RE.search(ev):
             prev_len = len(track_resolved) if track_resolved is not None else 0
             ev = _resolve(val, work, track_resolved)
@@ -1418,9 +1425,8 @@ def _ask_value(name, cur_vars):
 
 
 def _resolve(expr_str, cur_vars, resolved=None):
-    success = spdwarn()
-    ev = cal(expr_str, cur_vars)
-    success[0] = True
+    ev = run(cal, expr_str, cur_vars)
+    if ev is _ABORT: return _ABORT
     for _ in range(20):
         if isinstance(ev, _MissingArgs):
             answers = []
@@ -1434,9 +1440,8 @@ def _resolve(expr_str, cur_vars, resolved=None):
                     if resolved is not None and param not in resolved:
                         resolved.append(param)
                 answers.append(val)
-            success = spdwarn()
-            ev = ev.lam(*ev.provided, *answers)
-            success[0] = True
+            ev = run(ev.lam, *ev.provided, *answers)
+            if ev is _ABORT: return _ABORT
             continue
         if isinstance(ev, str):
             m = _UNDEF_RE.search(ev)
@@ -1446,9 +1451,8 @@ def _resolve(expr_str, cur_vars, resolved=None):
                 cur_vars[m.group(1)] = val
                 if resolved is not None and m.group(1) not in resolved:
                     resolved.append(m.group(1))
-                success = spdwarn()
-                ev = cal(expr_str, cur_vars)
-                success[0] = True
+                ev = run(cal, expr_str, cur_vars)
+                if ev is _ABORT: return _ABORT
                 continue
         break
     return ev
