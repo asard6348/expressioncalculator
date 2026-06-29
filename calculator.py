@@ -430,7 +430,7 @@ def run(func, *args, **kwargs):
     except KeyboardInterrupt:
         success[0] = True
         print(f"{YELLOW}Interrupted.{RST}")
-        return _ABORT
+        return _BACK
 
 
 def _make_wrapper(func):
@@ -775,7 +775,7 @@ def _fmt_error(msg: str) -> str:
 
 
 print(f"""Arbitrary-precision mathematical expression REPL.
-{GRAY}Commands: help / new (or Ctrl+C/D) / toggle / img (use constant i) / prec <n> / clear
+{GRAY}Commands: help / new / back (or Ctrl+C/D) / toggle / img (use constant i) / prec <n> / clear
 Operators: + − * / **
 Variables: single letters / word in underscores
 Subscript: e.g. x[1] / _work_[0]
@@ -998,13 +998,22 @@ def _eval_repeat(expr: str, v_dict: dict, chk: bool = False):
     n_val = cal(n_str, v_dict, chk)
     if not isinstance(n_val, dec): return n_val
     try:
+        n = int(n_val)
+    except Exception:
+        return _fmt_error("repeat() count must be a whole number.")
+    if n <= 0: return _fmt_error("repeat() count must be positive.")
+    vars_in = getv(inner_expr)
+    target  = vars_in[0] if vars_in else None
+    result  = dec(0)
+    work    = v_dict
+    try:
         for _ in range(n):
             result = cal(inner_expr, work, chk)
             if not isinstance(result, dec): return result
             if target is not None: work[target] = result
     except KeyboardInterrupt:
-        print(f"\n{YELLOW}Interrupted.{RST}")
-        return _ABORT
+        print(f"{YELLOW}Interrupted.{RST}")
+        return _BACK
     return result
 
 
@@ -1072,7 +1081,7 @@ def _do_schrodinger(raw: str) -> bool:
         if nv is _ABORT: return True
         if isinstance(nv, dec): Npts = int(nv)
     res = run(_solve_schrodinger, V_expr, int(n_v), xmin_v, xmax_v, Npts)
-    if res is not _ABORT: print(res)
+    if res is not _ABORT and res is not _BACK: print(res)
     return True
 
 
@@ -1206,7 +1215,7 @@ def actions(s: str) -> bool:
             ctx.prec      = n + GUARD_DIGITS
             mpmath.mp.dps = n + GUARD_DIGITS + 5
             result = run(_repin_constants)
-            if result is _ABORT:
+            if result is _ABORT or result is _BACK:
                 DISPLAY_PREC  = old_dp
                 ctx.prec      = old_cp
                 mpmath.mp.dps = old_md
@@ -1353,11 +1362,11 @@ def apply_inline(inline_str: str, all_vars: list, base: dict, isolate: bool, rep
         if fixed is not None and tgt in fixed:
             continue
         ev = run(cal, val, work)
-        if ev is _ABORT: break
+        if ev is _ABORT or ev is _BACK: break
         if isinstance(ev, str) and _UNDEF_RE.search(ev):
             prev_len = len(track_resolved) if track_resolved is not None else 0
             ev = _resolve(val, work, track_resolved)
-            if ev is _ABORT:
+            if ev is _ABORT or ev is _BACK:
                 break
             if isinstance(ev, (dec, Lambda)) and fixed is not None:
                 fixed.add(tgt)
@@ -1404,6 +1413,7 @@ def _strip_spaces(s: str) -> str:
 
 
 _ABORT    = object()
+_BACK     = object()
 _UNDEF_RE = re.compile(r"'([^']+)' is not defined")
 
 
@@ -1414,19 +1424,20 @@ def _ask_value(name, cur_vars):
             inp = input(f"{BOLD}{disp}:{RST} ").strip()
         except KeyboardInterrupt:
             print()
-            return _ABORT
+            return _BACK
         if not inp: continue
         if actions(inp): continue
         if inp.lower() == 'new': return _ABORT
+        if inp.lower() == 'back': return _BACK
         r = _resolve(inp, cur_vars)
-        if r is _ABORT or isinstance(r, (dec, Lambda, mpmath.mpc)):
+        if r is _ABORT or r is _BACK or isinstance(r, (dec, Lambda, mpmath.mpc)):
             return r
         print(r)
 
 
 def _resolve(expr_str, cur_vars, resolved=None):
     ev = run(cal, expr_str, cur_vars)
-    if ev is _ABORT: return _ABORT
+    if ev is _ABORT or ev is _BACK: return ev
     for _ in range(20):
         if isinstance(ev, _MissingArgs):
             answers = []
@@ -1435,24 +1446,24 @@ def _resolve(expr_str, cur_vars, resolved=None):
                     val = cur_vars[param]
                 else:
                     val = _ask_value(param, cur_vars)
-                    if val is _ABORT: return _ABORT
+                    if val is _ABORT or val is _BACK: return val
                     cur_vars[param] = val
                     if resolved is not None and param not in resolved:
                         resolved.append(param)
                 answers.append(val)
             ev = run(ev.lam, *ev.provided, *answers)
-            if ev is _ABORT: return _ABORT
+            if ev is _ABORT or ev is _BACK: return ev
             continue
         if isinstance(ev, str):
             m = _UNDEF_RE.search(ev)
             if m:
                 val = _ask_value(m.group(1), cur_vars)
-                if val is _ABORT: return _ABORT
+                if val is _ABORT or val is _BACK: return val
                 cur_vars[m.group(1)] = val
                 if resolved is not None and m.group(1) not in resolved:
                     resolved.append(m.group(1))
                 ev = run(cal, expr_str, cur_vars)
-                if ev is _ABORT: return _ABORT
+                if ev is _ABORT or ev is _BACK: return ev
                 continue
         break
     return ev
@@ -1507,7 +1518,7 @@ try:
         probe = cal(exp, {v: dec(0) for v in getv(exp)}, chk=True)
         if not isinstance(probe, dec):
             res = _resolve(exp, cur_vars)
-            if res is _ABORT: continue
+            if res is _ABORT or res is _BACK: continue
             if isinstance(res, Lambda) and not assigned_set: _last_lambda[0] = res
             print(_fmt_result(res))
             continue
@@ -1521,76 +1532,93 @@ try:
         if inline_str:
             cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE, fixed=fixed_inline, track_resolved=resolved_names, base_vals=resolved_base_vals)
 
-        broken = False
-        if det_vars:
-            for v in det_vars:
-                if v in cur_vars:
-                    continue
-                while True:
-                    v_disp = _longvar_inner(v) if _is_longvar(v) else v
-                    try:
-                        v_inp = input(f"{BOLD}{v_disp}:{RST} ").strip()
-                    except KeyboardInterrupt:
-                        print()
-                        broken = True; break
-                    if not v_inp: continue
-                    if actions(v_inp): continue
-                    if v_inp.lower() == 'new': broken = True; break
-                    ev = _resolve(v_inp, cur_vars)
-                    if ev is _ABORT: broken = True; break
-                    if isinstance(ev, Lambda):
-                        cur_vars[v] = ev
-                        _user_vars[v] = ev
-                    elif isinstance(ev, (dec, mpmath.mpc)):
-                        cur_vars[v] = ev
-                    else:
-                        print(ev)
-                        continue
-                    if inline_str:
-                        cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE, fixed=fixed_inline, track_resolved=resolved_names)
-                    break
-                if broken: break
-            if broken: continue
-
-        if inline_str:
-            cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE, fixed=fixed_inline, track_resolved=resolved_names)
-
+        ask_items   = [('det', v) for v in det_vars if v not in cur_vars]
+        ask_history = []
+        seen_sub    = set()
         asked_sub_keys = []
-        seen_sub = set()
-        for base, index_expr in get_sub_specs(exp):
-            idx_v = cal(index_expr, cur_vars)
-            if not isinstance(idx_v, dec):
-                continue
-            idx = int(idx_v)
-            key = f"{base}[{idx}]"
-            if key in seen_sub or key in cur_vars:
-                seen_sub.add(key); continue
-            if key in _user_vars:
-                cur_vars[key] = _user_vars[key]; seen_sub.add(key); continue
-            seen_sub.add(key)
-            asked_sub_keys.append(key)
+        broken = False
+        i = 0
+
+        while True:
+            for base, index_expr in get_sub_specs(exp):
+                idx_v = cal(index_expr, cur_vars)
+                if not isinstance(idx_v, dec): continue
+                idx = int(idx_v)
+                key = f"{base}[{idx}]"
+                if key in seen_sub: continue
+                seen_sub.add(key)
+                if key in cur_vars: continue
+                if key in _user_vars:
+                    cur_vars[key] = _user_vars[key]; continue
+                ask_items.append(('sub', base, idx, key))
+
+            if i >= len(ask_items): break
+
+            item = ask_items[i]
+            kind = item[0]
+            if kind == 'det':
+                v = item[1]
+                if v in cur_vars: i += 1; continue
+                prompt = f"{_longvar_inner(v) if _is_longvar(v) else v}:"
+            else:
+                _, base, idx, key = item
+                if key in cur_vars: i += 1; continue
+                prompt = f"{_longvar_inner(base) if _is_longvar(base) else base}[{idx}]:"
+
+            go_back  = False
+            go_retry = False
             while True:
-                disp = _longvar_inner(base) if _is_longvar(base) else base
                 try:
-                    v_inp = input(f"{BOLD}{disp}[{idx}]:{RST} ").strip()
+                    v_inp = input(f"{BOLD}{prompt}{RST} ").strip()
                 except KeyboardInterrupt:
-                    print()
-                    broken = True; break
+                    print(); go_back = True; break
                 if not v_inp: continue
                 if actions(v_inp): continue
                 if v_inp.lower() == 'new': broken = True; break
+                if v_inp.lower() == 'back': go_back = True; break
                 ev = _resolve(v_inp, cur_vars)
+                if ev is _BACK: go_retry = True; break
                 if ev is _ABORT: broken = True; break
-                cur_vars[key] = ev if isinstance(ev, dec) else dec(0)
+                if kind == 'det':
+                    if isinstance(ev, Lambda):
+                        cur_vars[v] = ev; _user_vars[v] = ev
+                    elif isinstance(ev, (dec, mpmath.mpc)):
+                        cur_vars[v] = ev
+                    else:
+                        print(ev); continue
+                    if inline_str:
+                        cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE, fixed=fixed_inline, track_resolved=resolved_names)
+                else:
+                    cur_vars[key] = ev if isinstance(ev, (dec, mpmath.mpc)) else dec(0)
+                    asked_sub_keys.append(key)
+                ask_history.append(i)
+                i += 1
                 break
+
             if broken: break
+            if go_retry: continue
+            if go_back:
+                if ask_history:
+                    prev_i = ask_history.pop()
+                    prev = ask_items[prev_i]
+                    if prev[0] == 'det':
+                        cur_vars.pop(prev[1], None)
+                    else:
+                        cur_vars.pop(prev[3], None)
+                        seen_sub.discard(prev[3])
+                        if prev[3] in asked_sub_keys: asked_sub_keys.remove(prev[3])
+                    i = prev_i
+                else:
+                    broken = True
+                    break
+
         if broken: continue
 
         if inline_str:
             cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE, fixed=fixed_inline, track_resolved=resolved_names)
 
         res = _resolve(exp, cur_vars, resolved_names)
-        if res is _ABORT: continue
+        if res is _ABORT or res is _BACK: continue
         if isinstance(res, Lambda) and not assigned_set: _last_lambda[0] = res
         print(_fmt_result(res))
 
@@ -1603,13 +1631,12 @@ try:
             try:
                 inp = input(f"{BOLD}>{RST} ").strip()
             except KeyboardInterrupt:
-                print()
-                break
+                print(); break
             if actions(inp): continue
-            if inp.lower() == 'new': break
+            if inp.lower() in ('new', 'back'): break
             if not inp:
                 res = _resolve(exp, cur_vars, resolved_names)
-                if res is _ABORT: break
+                if res is _ABORT or res is _BACK: break
                 if isinstance(res, Lambda) and not assigned_set: _last_lambda[0] = res
                 print(_fmt_result(res)); continue
 
@@ -1622,7 +1649,7 @@ try:
                 err = False; abort = False; tmp = cur_vars.copy()
                 for tgt, val in assigns:
                     ev = _resolve(val, tmp, resolved_names)
-                    if ev is _ABORT:
+                    if ev is _ABORT or ev is _BACK:
                         abort = True; break
                     if isinstance(ev, (dec, Lambda, mpmath.mpc)):
                         tmp[tgt] = ev
@@ -1637,20 +1664,17 @@ try:
                 cur_vars = tmp
             else:
                 ev = _resolve(inp, cur_vars, resolved_names)
-                if ev is _ABORT: break
+                if ev is _ABORT or ev is _BACK: break
                 target_list = det_vars if det_vars else (asked_sub_keys + resolved_names) if (asked_sub_keys or resolved_names) else [v for v in all_vars if v not in already_set and v not in assigned_set]
                 if isinstance(ev, (dec, mpmath.mpc, Lambda)) and target_list:
                     cur_vars[target_list[-1]] = ev
                     user_updated = {target_list[-1]}
                 elif isinstance(ev, (dec, mpmath.mpc, Lambda)):
-                    print(_fmt_result(ev))
-                    continue
+                    print(_fmt_result(ev)); continue
                 elif isinstance(ev, str):
-                    print(ev)
-                    continue
+                    print(ev); continue
                 else:
-                    _pending_expr[0] = inp
-                    break
+                    _pending_expr[0] = inp; break
 
             if inline_str:
                 for k, v in resolved_base_vals.items():
@@ -1659,7 +1683,7 @@ try:
                 cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE, protect=just_set | user_pinned)
 
             res = _resolve(exp, cur_vars, resolved_names)
-            if res is _ABORT: break
+            if res is _ABORT or res is _BACK: break
             if isinstance(res, Lambda) and not assigned_set: _last_lambda[0] = res
             print(_fmt_result(res))
 except EOFError:
