@@ -44,18 +44,42 @@ class _MissingArgs:
     def __str__(self):
         return self.__repr__()
 
+def _fmt_sub_key(base: str, key) -> str:
+    if isinstance(key, (dec, _DisplayDec)):
+        return f"{base}[{int(key) if key == key.to_integral_value() else key}]"
+    return f"{base}[{key}]"
+
 class SubProxy:
-    __slots__ = ('name', 'env')
-    def __init__(self, name: str, env: dict):
-        self.name = name
-        self.env  = env
+    __slots__ = ('name', 'env', '_orig')
+    def __init__(self, name: str, env: dict, orig=None):
+        self.name  = name
+        self.env   = env
+        self._orig = orig
     def __getitem__(self, key):
-        k = f"{self.name}[{int(key)}]"
-        if k in self.env:
-            return self.env[k]
+        if isinstance(key, SubProxy): key = key._orig
+        k = _fmt_sub_key(self.name, key)
+        if k in self.env: return self.env[k]
         raise NameError(f"'{k}' is not defined")
     def __repr__(self):
-        return f"SubProxy({self.name!r})"
+        return repr(self._orig) if self._orig is not None else f"SubProxy({self.name!r})"
+    def __add__(self, o):      return self._orig + o  if self._orig is not None else NotImplemented
+    def __radd__(self, o):     return o + self._orig  if self._orig is not None else NotImplemented
+    def __sub__(self, o):      return self._orig - o  if self._orig is not None else NotImplemented
+    def __rsub__(self, o):     return o - self._orig  if self._orig is not None else NotImplemented
+    def __mul__(self, o):      return self._orig * o  if self._orig is not None else NotImplemented
+    def __rmul__(self, o):     return o * self._orig  if self._orig is not None else NotImplemented
+    def __truediv__(self, o):  return self._orig / o  if self._orig is not None else NotImplemented
+    def __rtruediv__(self, o): return o / self._orig  if self._orig is not None else NotImplemented
+    def __pow__(self, o):      return self._orig ** o if self._orig is not None else NotImplemented
+    def __rpow__(self, o):     return o ** self._orig if self._orig is not None else NotImplemented
+    def __neg__(self):         return -self._orig     if self._orig is not None else NotImplemented
+    def __pos__(self):         return +self._orig     if self._orig is not None else NotImplemented
+    def __abs__(self):         return abs(self._orig) if self._orig is not None else NotImplemented
+    def __eq__(self, o):       return self._orig == o if self._orig is not None else NotImplemented
+    def __lt__(self, o):       return self._orig < o  if self._orig is not None else NotImplemented
+    def __le__(self, o):       return self._orig <= o if self._orig is not None else NotImplemented
+    def __gt__(self, o):       return self._orig > o  if self._orig is not None else NotImplemented
+    def __ge__(self, o):       return self._orig >= o if self._orig is not None else NotImplemented
 
 class _DisplayDec(dec):
     def __str__(self):
@@ -840,6 +864,12 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
         if not tokens and expr.strip():
             return _fmt_error("The given expression has invalid syntax.")
 
+        for idx in range(len(tokens) - 2):
+            if (tokens[idx].type == tokenize.NAME and
+                    tokens[idx+1].string == '[' and
+                    tokens[idx+2].type == _TOK_STRING):
+                return _fmt_error("The given expression has invalid syntax.")
+
         env = {**dco, **{k: (dec(v) if isinstance(v, _DisplayDec) else v) for k, v in v_dict.items()}, 'dec': dec, 'mpmath': mpmath, 'Lambda': Lambda}
 
         for idx in range(len(tokens) - 2):
@@ -856,7 +886,7 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
         for idx, t in enumerate(tokens):
             if idx > 0:
                 prev = tokens[idx - 1]
-                prev_is_value = prev.type in (tokenize.NUMBER, _TOK_STRING) or prev.string == ')'
+                prev_is_value = prev.type in (tokenize.NUMBER, _TOK_STRING) or prev.string in (')', ']')
                 prev_is_name  = prev.type == tokenize.NAME
                 curr_is_value = t.type in (tokenize.NUMBER, _TOK_STRING) or t.string == '('
                 curr_is_name  = t.type == tokenize.NAME
@@ -895,11 +925,11 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
 
         sub_bases = set()
         for k in v_dict:
-            m = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\[\d+\]$', str(k))
+            m = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\[.+\]$', str(k))
             if m:
                 sub_bases.add(m.group(1))
         for base in sub_bases:
-            env[base] = SubProxy(base, env)
+            env[base] = SubProxy(base, env, env.get(base))
 
         try:
             raw = eval(fin, {"__builtins__": {}}, env)
@@ -1541,10 +1571,10 @@ try:
 
         while True:
             for base, index_expr in get_sub_specs(exp):
-                idx_v = cal(index_expr, cur_vars)
-                if not isinstance(idx_v, dec): continue
-                idx = int(idx_v)
-                key = f"{base}[{idx}]"
+                idx = cal(index_expr, cur_vars)
+                if not isinstance(idx, dec): continue
+                key = _fmt_sub_key(base, idx)
+                key_disp = key[len(base):]
                 if key in seen_sub: continue
                 seen_sub.add(key)
                 if key in cur_vars: continue
@@ -1563,7 +1593,7 @@ try:
             else:
                 _, base, idx, key = item
                 if key in cur_vars: i += 1; continue
-                prompt = f"{_longvar_inner(base) if _is_longvar(base) else base}[{idx}]:"
+                prompt = f"{_longvar_inner(base) if _is_longvar(base) else base}{key_disp}:"
 
             go_back  = False
             go_retry = False
