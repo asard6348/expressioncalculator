@@ -498,6 +498,7 @@ dco['round']  = _round
 dco['rad']    = dco['radians']
 dco['deg']    = dco['degrees']
 dco['repeat'] = lambda *_: _fmt_error("repeat() must be a top-level call: repeat(expr, n)")
+dco['findroot'] = lambda *_: _fmt_error("findroot() must be a top-level call: findroot(expr, x0)")
 dco['mpf'] = lambda x: mpmath.mpf(str(x))
 dco['mpc'] = lambda r, i: mpmath.mpc(str(r), str(i))
 dco['i'] = mpmath.mpc(0, 1)
@@ -521,6 +522,27 @@ def _hydrogen_e(n):
     if n < 1: return _fmt_error("hydrogen_e: n must be ≥ 1")
     return _to_dec(mpmath.mpf('-1') / (2 * n * n))
 dco['hydrogen_e'] = _hydrogen_e
+
+
+def _findroot(f, *x0):
+    if not isinstance(f, Lambda):
+        return _fmt_error("findroot() expects a Lambda (quoted expression) as first argument.  "
+                          "Example: findroot(\"x**2-4\", 1)")
+    if not f.params:
+        return _fmt_error("findroot(): expression has no free variable.")
+
+    def mp_f(*args):
+        v = {name: dec(mpmath.nstr(val, ctx.prec + 5)) for name, val in zip(f.params, args)}
+        r = cal(f.expr, v, nodisplay=True)
+        if not isinstance(r, dec):
+            raise ValueError(str(r))
+        return mpmath.mpf(str(r))
+
+    x0_mp  = [mpmath.mpf(str(x)) for x in x0]
+    x0_arg = tuple(x0_mp) if len(x0_mp) > 1 else x0_mp[0]
+    result = mpmath.findroot(mp_f, x0_arg)
+    return _to_dec(result)
+dco['findroot'] = _findroot
 
 
 def _solve_anharmonic(n, c):
@@ -858,6 +880,8 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
 
     if expr.strip().startswith('repeat(') and expr.strip().endswith(')'):
         return _eval_repeat(expr.strip(), v_dict, chk)
+    if expr.strip().startswith('findroot(') and expr.strip().endswith(')'):
+        return _eval_findroot(expr.strip(), v_dict, chk)
 
     try:
         tokens = get_clean_tokens(expr)
@@ -890,11 +914,13 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
                 prev_is_name  = prev.type == tokenize.NAME
                 curr_is_value = t.type in (tokenize.NUMBER, _TOK_STRING) or t.string == '('
                 curr_is_name  = t.type == tokenize.NAME
+                curr_is_string = t.type == _TOK_STRING
 
                 insert_mul = (
                     (prev_is_value and curr_is_name) or
                     (prev_is_name  and curr_is_value) or
-                    (prev_is_name  and curr_is_name)
+                    (prev_is_name  and curr_is_name) or
+                    (prev_is_value and curr_is_string)
                 )
 
                 if insert_mul and t.string == '(' and prev_is_name:
@@ -983,16 +1009,21 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
             return _fmt_error(f"'{name}' is not defined.")
         except TypeError as te:
             if chk: return dec(1)
-            return _fmt_error(f"Type error: {str(te).splitlines()[0]}.")
+            terr = str(te).splitlines()[0]
+            return _fmt_error(f"Type error: {terr}")
         except ZeroDivisionError:
             if chk: return dec(1)
             return _fmt_error("Division by zero.")
         except decimal.Overflow:
             if chk: return dec(1)
             return _fmt_error("Result too large.")
-        except (decimal.InvalidOperation, ValueError):
+        except decimal.InvalidOperation:
             if chk: return dec(1)
             return _fmt_error("Invalid operation from input.")
+        except ValueError as ve:
+            if chk: return dec(1)
+            verr = str(ve).splitlines()[0]
+            return _fmt_error(f"Value error: {verr}")
         except OverflowError:
             if chk: return dec(1)
             return _fmt_error("Numerical overflow.")
@@ -1001,7 +1032,7 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
             raise
 
     except Exception as e:
-        return _fmt_error(f"Calculation problem: {e}.")
+        return _fmt_error(f"Calculation problem: {e}")
 
 
 def _parse_repeat(expr: str):
@@ -1045,6 +1076,82 @@ def _eval_repeat(expr: str, v_dict: dict, chk: bool = False):
         print(f"{YELLOW}Interrupted.{RST}")
         return _BACK
     return result
+
+
+def _parse_findroot(expr: str):
+    s = expr.strip()
+    if not (s.startswith('findroot(') and s.endswith(')')):
+        return None
+    body = s[9:-1]
+    parts = [p.strip() for p in _split_top_level(body, ',')]
+    if len(parts) < 2:
+        return None
+    return parts
+
+
+def _eval_findroot(expr: str, v_dict: dict, chk: bool = False):
+    parts = _parse_findroot(expr)
+    if parts is None:
+        return _fmt_error("findroot() syntax: findroot(expr, x0[, x1])")
+
+    expr_part = parts[0]
+    quoted = ((expr_part.startswith('"') and expr_part.endswith('"')) or
+              (expr_part.startswith("'") and expr_part.endswith("'")))
+    if not quoted:
+        return _fmt_error("findroot() expects a Lambda (quoted expression) as first argument.  "
+                          "Example: findroot(\"x**2-4\", 1)")
+    lam_expr = expr_part[1:-1]
+    params   = _get_lambda_params(lam_expr)
+    if not params:
+        return _fmt_error("findroot(): expression has no free variable.")
+    root_var, extra = params[0], params[1:]
+
+    if chk:
+        probe_vars = {p: dec(0) for p in params}
+        return cal(lam_expr, probe_vars, chk=True)
+
+    x0_vals = []
+    for p in parts[1:]:
+        v = cal(p, v_dict, nodisplay=True)
+        if not isinstance(v, dec):
+            return v
+        x0_vals.append(v)
+
+    fixed = {}
+    for name in extra:
+        if name in v_dict and isinstance(v_dict[name], (dec, mpmath.mpc)):
+            fixed[name] = v_dict[name]
+        else:
+            return _fmt_error(f"'{name}' is not defined.")
+
+    last_err = [None]
+
+    def mp_f(x):
+        v = dict(fixed)
+        v[root_var] = dec(mpmath.nstr(x, ctx.prec + 5))
+        r = cal(lam_expr, v, nodisplay=True)
+        if not isinstance(r, dec):
+            last_err[0] = r
+            raise ValueError(str(r))
+        return mpmath.mpf(str(r))
+
+    x0_mp  = [mpmath.mpf(str(x)) for x in x0_vals]
+    x0_arg = tuple(x0_mp) if len(x0_mp) > 1 else x0_mp[0]
+
+    try:
+        result = mpmath.findroot(mp_f, x0_arg)
+    except ValueError:
+        if last_err[0] is not None:
+            return last_err[0]
+        try:
+            result = mpmath.findroot(mp_f, x0_arg, tol=mpmath.mpf('1e-15'))
+            print(f"{YELLOW}findroot: root may have multiplicity > 1; result is approximate.{RST}")
+        except ValueError as err2:
+            if last_err[0] is not None:
+                return last_err[0]
+            return _fmt_error(f"findroot: {str(err2).splitlines()[0]}")
+
+    return _display(_to_dec(result))
 
 
 def hlp():
@@ -1694,7 +1801,8 @@ try:
                 cur_vars = tmp
             else:
                 ev = _resolve(inp, cur_vars, resolved_names)
-                if ev is _ABORT or ev is _BACK: break
+                if ev is _ABORT: break
+                if ev is _BACK: continue
                 target_list = det_vars if det_vars else (asked_sub_keys + resolved_names) if (asked_sub_keys or resolved_names) else [v for v in all_vars if v not in already_set and v not in assigned_set]
                 if isinstance(ev, (dec, mpmath.mpc, Lambda)) and target_list:
                     cur_vars[target_list[-1]] = ev
