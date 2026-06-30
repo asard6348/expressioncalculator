@@ -1,6 +1,10 @@
 import ast, tokenize, io, decimal, inspect, mpmath, re
 threading = None
 time      = None
+try:
+    import readline
+except ImportError:
+    pass
 
 dec           = decimal.Decimal
 ctx           = decimal.getcontext()
@@ -874,6 +878,94 @@ def _fmt_result(v):
     return str(v)
 
 
+def _tok_text(t):
+    if t.type == tokenize.NUMBER:
+        if t.string.lower().endswith('j'):
+            coeff = t.string[:-1] or '1'
+            return f'mpmath.mpc(0, mpmath.mpf("{coeff}"))'
+        return f'dec("{t.string}")'
+    if t.type == _TOK_STRING:
+        safe = t.string.replace('\\', '\\\\').replace('"', '\\"')
+        return f'Lambda("{safe}")'
+    return t.string
+
+
+def _needs_mul(prev, curr, prev_name, v_dict):
+    prev_is_value = prev.type in (tokenize.NUMBER, _TOK_STRING) or prev.string in (')', ']')
+    prev_is_name  = prev.type == tokenize.NAME
+    curr_is_value = curr.type in (tokenize.NUMBER, _TOK_STRING) or curr.string == '('
+    curr_is_name  = curr.type == tokenize.NAME
+    curr_is_string = curr.type == _TOK_STRING
+
+    insert = (
+        (prev_is_value and curr_is_name) or
+        (prev_is_name  and curr_is_value) or
+        (prev_is_name  and curr_is_name) or
+        (prev_is_value and curr_is_string)
+    )
+    if insert and curr.string == '(' and prev_is_name:
+        if callable(dco.get(prev_name)):
+            insert = False
+        elif isinstance(v_dict.get(prev_name), Lambda):
+            insert = False
+    return insert
+
+
+def _is_naked(prev_last, curr_first, v_dict):
+    if curr_first.string not in ('(', '['):
+        return False
+    if prev_last.type != tokenize.NAME:
+        return False
+    return not _needs_mul(prev_last, curr_first, prev_last.string, v_dict)
+
+
+def _group_tokens(tokens: list, lo: int, hi: int, v_dict: dict) -> str:
+    atoms = []
+    i = lo
+    while i < hi:
+        t = tokens[i]
+        if t.string in ('(', '['):
+            open_ch  = t.string
+            close_ch = ')' if open_ch == '(' else ']'
+            depth = 1
+            j = i + 1
+            while j < hi and depth > 0:
+                if   tokens[j].string == open_ch:  depth += 1
+                elif tokens[j].string == close_ch: depth -= 1
+                j += 1
+            inner = _group_tokens(tokens, i + 1, j - 1, v_dict)
+            atoms.append((open_ch + inner + close_ch, t, tokens[j - 1]))
+            i = j
+        else:
+            atoms.append((_tok_text(t), t, t))
+            i += 1
+
+    pieces = []
+    k = 0
+    while k < len(atoms):
+        chain = [atoms[k][0]]
+        m = k
+        while m + 1 < len(atoms):
+            prev_last  = atoms[m][2]
+            curr_first = atoms[m + 1][1]
+            prev_name  = prev_last.string if prev_last.type == tokenize.NAME else None
+            if not _needs_mul(prev_last, curr_first, prev_name, v_dict):
+                break
+            chain.append(atoms[m + 1][0])
+            m += 1
+
+        unsafe_start = k > 0 and _is_naked(atoms[k - 1][2], atoms[k][1], v_dict)
+        unsafe_end   = (m + 1 < len(atoms) and
+                        _is_naked(atoms[m][2], atoms[m + 1][1], v_dict))
+
+        if len(chain) > 1 and not unsafe_start and not unsafe_end:
+            pieces.append('(' + '*'.join(chain) + ')')
+        else:
+            pieces.append('*'.join(chain))
+        k = m + 1
+    return ''.join(pieces)
+
+
 def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = False):
     if v_dict is None:
         v_dict = {}
@@ -906,48 +998,7 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
                     disp = _longvar_inner(t0.string) if _is_longvar(t0.string) else t0.string
                     return _fmt_error(f"'{disp}' is not a function.")
 
-        parts = []
-        for idx, t in enumerate(tokens):
-            if idx > 0:
-                prev = tokens[idx - 1]
-                prev_is_value = prev.type in (tokenize.NUMBER, _TOK_STRING) or prev.string in (')', ']')
-                prev_is_name  = prev.type == tokenize.NAME
-                curr_is_value = t.type in (tokenize.NUMBER, _TOK_STRING) or t.string == '('
-                curr_is_name  = t.type == tokenize.NAME
-                curr_is_string = t.type == _TOK_STRING
-
-                insert_mul = (
-                    (prev_is_value and curr_is_name) or
-                    (prev_is_name  and curr_is_value) or
-                    (prev_is_name  and curr_is_name) or
-                    (prev_is_value and curr_is_string)
-                )
-
-                if insert_mul and t.string == '(' and prev_is_name:
-
-                    if callable(dco.get(prev.string)):
-                        insert_mul = False
-                    elif isinstance(v_dict.get(prev.string), Lambda):
-                        insert_mul = False                                       
-
-                if insert_mul:
-                    parts.append('*')
-
-
-            if t.type == tokenize.NUMBER:
-                if t.string.lower().endswith('j'):
-                    coeff = t.string[:-1] or '1'
-                    parts.append(f'mpmath.mpc(0, mpmath.mpf("{coeff}"))')
-                else:
-                    parts.append(f'dec("{t.string}")')
-            elif t.type == _TOK_STRING:
-
-                safe = t.string.replace('\\', '\\\\').replace('"', '\\"')
-                parts.append(f'Lambda("{safe}")')
-            else:
-                parts.append(t.string)
-
-        fin = "".join(parts)
+        fin = _group_tokens(tokens, 0, len(tokens), v_dict)
 
         sub_bases = set()
         for k in v_dict:
