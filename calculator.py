@@ -1815,9 +1815,12 @@ try:
             continue
         
         user_pinned = set()
+        _init_targets = det_vars if det_vars else (asked_sub_keys + resolved_names) if (asked_sub_keys or resolved_names) else [v for v in all_vars if v not in already_set and v not in assigned_set]
+        last_touched = _init_targets[-1] if _init_targets else None
         while True:
             try:
-                inp = input(f"{BOLD}>{RST} ").strip()
+                lbl = f"{GRAY}{_longvar_inner(last_touched) if _is_longvar(last_touched) else last_touched}{RST}" if last_touched else ""
+                inp = input(f"{lbl}{BOLD}>{RST} ").strip()
             except KeyboardInterrupt:
                 print(); break
             if actions(inp): continue
@@ -1850,14 +1853,19 @@ try:
                 user_updated = just_set.copy()
                 user_pinned |= just_set
                 cur_vars = tmp
+                last_touched = assigns[-1][0]
             else:
                 ev = _resolve(inp, cur_vars, resolved_names)
                 if ev is _ABORT: break
                 if ev is _BACK: continue
-                target_list = det_vars if det_vars else (asked_sub_keys + resolved_names) if (asked_sub_keys or resolved_names) else [v for v in all_vars if v not in already_set and v not in assigned_set]
-                if isinstance(ev, (dec, mpmath.mpc, Lambda)) and target_list:
-                    cur_vars[target_list[-1]] = ev
-                    user_updated = {target_list[-1]}
+                target = last_touched if last_touched is not None else (
+                    det_vars[-1] if det_vars else
+                    (asked_sub_keys + resolved_names)[-1] if (asked_sub_keys or resolved_names) else
+                    ([v for v in all_vars if v not in already_set and v not in assigned_set] or [None])[-1])
+                if isinstance(ev, (dec, mpmath.mpc, Lambda)) and target is not None:
+                    cur_vars[target] = ev
+                    user_updated = {target}
+                    last_touched = target
                 elif isinstance(ev, (dec, mpmath.mpc, Lambda)):
                     print(_fmt_result(ev)); continue
                 elif isinstance(ev, str):
