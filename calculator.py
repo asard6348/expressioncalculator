@@ -51,6 +51,8 @@ class _MissingArgs:
 def _fmt_sub_key(base: str, key) -> str:
     if isinstance(key, (dec, _DisplayDec)):
         return f"{base}[{int(key) if key == key.to_integral_value() else key}]"
+    if isinstance(key, str):
+        return f'{base}[{key}]'
     return f"{base}[{key}]"
 
 class SubProxy:
@@ -115,7 +117,10 @@ def get_sub_specs(s: str) -> list:
                     depth -= 1
                     if depth == 0: break
                 j += 1
-            index_expr = ''.join(tk.string for tk in tokens[i+2:j])
+            index_toks = tokens[i+2:j]
+            if len(index_toks) == 1 and index_toks[0].type == _TOK_SFSTRING:
+                i = j + 1; continue
+            index_expr = ''.join(tk.string for tk in index_toks)
             key = (t.string, index_expr)
             if key not in seen:
                 specs.append((t.string, index_expr))
@@ -220,7 +225,36 @@ def _should_split(name: str) -> bool:
     return all(t.string in dco and not callable(dco[t.string]) for t in toks)
 
 
-_TOK_STRING = 200                                              
+_TOK_STRING = 200
+_TOK_SFSTRING = 201
+
+_sfstr_to_mangled = {}
+_mangled_to_sfstr = {}
+
+def _register_sfstr(inner: str) -> str:
+    if inner not in _sfstr_to_mangled:
+        n = len(_sfstr_to_mangled)
+        m = f"XSFSTRx{n}x"
+        _sfstr_to_mangled[inner] = m
+        _mangled_to_sfstr[m]     = inner
+    return _sfstr_to_mangled[inner]
+
+def _is_sfstr(s: str) -> bool:
+    return s in _mangled_to_sfstr
+
+def _sfstr_inner(s: str) -> str:
+    return _mangled_to_sfstr.get(s, s)
+
+def _catkey(*args):
+    parts = []
+    for a in args:
+        if isinstance(a, str):
+            parts.append(a)
+        elif isinstance(a, (dec, _DisplayDec)):
+            parts.append(str(int(a)) if a == a.to_integral_value() else str(a))
+        else:
+            parts.append(str(a))
+    return ''.join(parts)
 
 def get_clean_tokens(s: str) -> list:
     s = _preprocess_lv(s)
@@ -248,6 +282,9 @@ def get_clean_tokens(s: str) -> list:
             if t.type == tokenize.NAME:
                 if _is_longvar(t.string):
                     raw_tokens.append(Tok(t.type, t.string))
+                    continue
+                if _is_sfstr(t.string):
+                    raw_tokens.append(Tok(_TOK_SFSTRING, t.string))
                     continue
                 if t.string not in dco:
                     has_digit = any(c.isdigit() for c in t.string)
@@ -506,6 +543,7 @@ dco['findroot'] = lambda *_: _fmt_error("findroot() must be a top-level call: fi
 dco['mpf'] = lambda x: mpmath.mpf(str(x))
 dco['mpc'] = lambda r, i: mpmath.mpc(str(r), str(i))
 dco['i'] = mpmath.mpc(0, 1)
+dco['cat'] = _catkey
 
 
 def _to_dec(v):
@@ -887,21 +925,28 @@ def _tok_text(t):
     if t.type == _TOK_STRING:
         safe = t.string.replace('\\', '\\\\').replace('"', '\\"')
         return f'Lambda("{safe}")'
+    if t.type == _TOK_SFSTRING:
+        safe = _sfstr_inner(t.string).replace('\\', '\\\\').replace('"', '\\"')
+        return f'"{safe}"'
     return t.string
 
 
 def _needs_mul(prev, curr, prev_name, v_dict):
-    prev_is_value = prev.type in (tokenize.NUMBER, _TOK_STRING) or prev.string in (')', ']')
-    prev_is_name  = prev.type == tokenize.NAME
-    curr_is_value = curr.type in (tokenize.NUMBER, _TOK_STRING) or curr.string == '('
-    curr_is_name  = curr.type == tokenize.NAME
+    prev_is_value  = prev.type in (tokenize.NUMBER, _TOK_STRING) or prev.string in (')', ']')
+    prev_is_name   = prev.type == tokenize.NAME
+    prev_is_sfstr  = prev.type == _TOK_SFSTRING
+    curr_is_value  = curr.type in (tokenize.NUMBER, _TOK_STRING) or curr.string == '('
+    curr_is_name   = curr.type == tokenize.NAME
     curr_is_string = curr.type == _TOK_STRING
+    curr_is_sfstr  = curr.type == _TOK_SFSTRING
 
     insert = (
         (prev_is_value and curr_is_name) or
         (prev_is_name  and curr_is_value) or
         (prev_is_name  and curr_is_name) or
-        (prev_is_value and curr_is_string)
+        (prev_is_value and curr_is_string) or
+        (prev_is_sfstr and (curr_is_value or curr_is_name or curr_is_sfstr)) or
+        ((prev_is_value or prev_is_name) and curr_is_sfstr)
     )
     if insert and curr.string == '(' and prev_is_name:
         if callable(dco.get(prev_name)):
@@ -919,7 +964,7 @@ def _is_naked(prev_last, curr_first, v_dict):
     return not _needs_mul(prev_last, curr_first, prev_last.string, v_dict)
 
 
-def _group_tokens(tokens: list, lo: int, hi: int, v_dict: dict) -> str:
+def _group_tokens(tokens: list, lo: int, hi: int, v_dict: dict, in_subscript: bool = False) -> str:
     atoms = []
     i = lo
     while i < hi:
@@ -933,7 +978,7 @@ def _group_tokens(tokens: list, lo: int, hi: int, v_dict: dict) -> str:
                 if   tokens[j].string == open_ch:  depth += 1
                 elif tokens[j].string == close_ch: depth -= 1
                 j += 1
-            inner = _group_tokens(tokens, i + 1, j - 1, v_dict)
+            inner = _group_tokens(tokens, i + 1, j - 1, v_dict, in_subscript=(open_ch == '['))
             atoms.append((open_ch + inner + close_ch, t, tokens[j - 1]))
             i = j
         else:
@@ -958,12 +1003,70 @@ def _group_tokens(tokens: list, lo: int, hi: int, v_dict: dict) -> str:
         unsafe_end   = (m + 1 < len(atoms) and
                         _is_naked(atoms[m][2], atoms[m + 1][1], v_dict))
 
-        if len(chain) > 1 and not unsafe_start and not unsafe_end:
-            pieces.append('(' + '*'.join(chain) + ')')
+        if len(chain) > 1:
+            has_sfstr_in_chain = any(
+                atoms[k + j2][1].type == _TOK_SFSTRING
+                for j2 in range(m - k + 1)
+            )
+            if in_subscript and has_sfstr_in_chain:
+                args = []; num_group = []
+                for j2 in range(m - k + 1):
+                    if atoms[k + j2][1].type == _TOK_SFSTRING:
+                        if num_group:
+                            args.append('(' + '*'.join(num_group) + ')' if len(num_group) > 1 else num_group[0])
+                            num_group = []
+                        args.append(chain[j2])
+                    else:
+                        num_group.append(chain[j2])
+                if num_group:
+                    args.append('(' + '*'.join(num_group) + ')' if len(num_group) > 1 else num_group[0])
+                pieces.append('cat(' + ', '.join(args) + ')')
+            elif not unsafe_start and not unsafe_end:
+                pieces.append('(' + '*'.join(chain) + ')')
+            else:
+                pieces.append('*'.join(chain))
         else:
-            pieces.append('*'.join(chain))
+            pieces.append(chain[0])
         k = m + 1
     return ''.join(pieces)
+
+
+_last_fmt_parts: list = [('value',)]
+
+
+def _extract_format_sfstrings(tokens: list):
+    fmt_parts = []; cleaned = []; bracket_depth = 0
+    for t in tokens:
+        if t.string == '[':
+            bracket_depth += 1; cleaned.append(t)
+        elif t.string == ']':
+            if bracket_depth > 0: bracket_depth -= 1
+            cleaned.append(t)
+        elif t.type == _TOK_SFSTRING:
+            if bracket_depth > 0:
+                cleaned.append(t)
+            else:
+                fmt_parts.append(('sfstr', _sfstr_inner(t.string)))
+        else:
+            cleaned.append(t)
+            if bracket_depth == 0 and (not fmt_parts or fmt_parts[-1][0] != 'value'):
+                fmt_parts.append(('value',))
+    return cleaned, fmt_parts
+
+
+def _apply_sfstr_format(fmt_parts: list, result_str: str) -> str:
+    if not any(p[0] == 'sfstr' for p in fmt_parts):
+        return result_str
+    if result_str.startswith(RED):
+        return result_str
+    return ''.join(p[1] if p[0] == 'sfstr' else result_str for p in fmt_parts)
+
+
+def _normalize_sub_key(key: str) -> str:
+    m = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\[(XSFSTRx\d+x)\]$', key)
+    if m and _is_sfstr(m.group(2)):
+        return f'{m.group(1)}[{_sfstr_inner(m.group(2))}]'
+    return key
 
 
 def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = False):
@@ -979,6 +1082,11 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
         tokens = get_clean_tokens(expr)
         if not tokens and expr.strip():
             return _fmt_error("The given expression has invalid syntax.")
+        tokens, _sfmt = _extract_format_sfstrings(tokens)
+        if not nodisplay and not chk:
+            _last_fmt_parts.clear(); _last_fmt_parts.extend(_sfmt)
+        if not tokens:
+            return _SFSTR_RESULT
 
         for idx in range(len(tokens) - 2):
             if (tokens[idx].type == tokenize.NAME and
@@ -1005,6 +1113,11 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
             m = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\[.+\]$', str(k))
             if m:
                 sub_bases.add(m.group(1))
+        for _i2 in range(len(tokens) - 1):
+            if (tokens[_i2].type == tokenize.NAME and
+                    tokens[_i2].string not in dco and
+                    tokens[_i2+1].string == '['):
+                sub_bases.add(tokens[_i2].string)
         for base in sub_bases:
             env[base] = SubProxy(base, env, env.get(base))
 
@@ -1449,7 +1562,8 @@ def _split_top_level(s: str, sep: str) -> list:
 def _is_assign_target(lhs: str) -> bool:
     return ((len(lhs) == 1 and lhs.isalpha()) or
             _is_longvar(lhs) or
-            bool(re.match(r'^[A-Za-z_][A-Za-z0-9_]*\[\d+\]$', lhs)))
+            bool(re.match(r'^[A-Za-z_][A-Za-z0-9_]*\[\d+\]$', lhs)) or
+            bool(re.match(r'^[A-Za-z_][A-Za-z0-9_]*\[XSFSTRx\d+x\]$', lhs)))
 
 
 def _parse_assignment(seg: str):
@@ -1497,7 +1611,8 @@ def sorta(s: str, allowed: list) -> list:
         if '=' in p:
             tgt, val = p.split('=', 1)
             tgt = tgt.strip()
-            if tgt in allowed or re.match(r'^[A-Za-z_][A-Za-z0-9_]*\[\d+\]$', tgt):
+            if tgt in allowed or re.match(r'^[A-Za-z_][A-Za-z0-9_]*\[\d+\]$', tgt) or re.match(r'^[A-Za-z_][A-Za-z0-9_]*\[XSFSTRx\d+x\]$', tgt):
+                tgt = _normalize_sub_key(tgt)
                 deps = [x for x in allowed if x in val]
                 pairs.append((tgt, val, deps))
 
@@ -1562,6 +1677,9 @@ def apply_inline(inline_str: str, all_vars: list, base: dict, isolate: bool, rep
                 for var in track_resolved[prev_len:]:
                     if var in work:
                         base_vals[var] = work[var]
+        if isinstance(ev, _SFStrResult):
+            _inline_error[0] = _fmt_error("Invalid operation from input.")
+            break
         if isinstance(ev, (dec, Lambda, mpmath.mpc)):
             work[tgt] = ev
             if isinstance(ev, Lambda):
@@ -1573,36 +1691,53 @@ def apply_inline(inline_str: str, all_vars: list, base: dict, isolate: bool, rep
 
 def _strip_spaces(s: str) -> str:
     buf = []
-    in_str = False; str_char = ''
+    in_str = False; str_char = ''; last_was_callable = False
     i = 0
     while i < len(s):
         ch = s[i]
         if in_str:
             buf.append(ch)
             if ch == str_char: in_str = False
-            i += 1
+            last_was_callable = True; i += 1
         elif ch in ('"', "'"):
             in_str = True; str_char = ch; buf.append(ch)
-            i += 1
+            last_was_callable = False; i += 1
         elif ch == '_':
             j = s.find('_', i + 1)
             if j > i:
                 buf.append(_register_longvar(s[i+1:j]))
-                i = j + 1
+                last_was_callable = True; i = j + 1
             else:
-                buf.append('_')
-                i += 1
+                buf.append('_'); last_was_callable = False; i += 1
+        elif ch == '[':
+            if last_was_callable:
+                buf.append(ch); last_was_callable = False; i += 1
+            else:
+                depth = 1; j = i + 1
+                while j < len(s) and depth > 0:
+                    if s[j] == '[': depth += 1
+                    elif s[j] == ']': depth -= 1
+                    j += 1
+                buf.append(' '); buf.append(_register_sfstr(s[i+1:j-1])); buf.append(' ')
+                last_was_callable = False; i = j
+        elif ch in (')', ']'):
+            buf.append(ch); last_was_callable = True; i += 1
         elif ch != ' ':
-            buf.append(ch)
-            i += 1
+            buf.append(ch); last_was_callable = ch.isalnum(); i += 1
         else:
-            i += 1
+            last_was_callable = False; i += 1
     return re.sub(r'(XLONGx\d+x)(\d)', r'\1*\2', ''.join(buf))
 
 
 _ABORT    = object()
 _BACK     = object()
 _UNDEF_RE = re.compile(r"'([^']+)' is not defined")
+
+class _SFStrResult:
+    pass
+
+_SFSTR_RESULT = _SFStrResult()
+_inline_error: list = [None]
 
 
 def _ask_value(name, cur_vars):
@@ -1707,8 +1842,11 @@ try:
         if not isinstance(probe, dec):
             res = _resolve(exp, cur_vars)
             if res is _ABORT or res is _BACK: continue
+            if isinstance(res, _SFStrResult):
+                print(_apply_sfstr_format(_last_fmt_parts, ""))
+                continue
             if isinstance(res, Lambda) and not assigned_set: _last_lambda[0] = res
-            print(_fmt_result(res))
+            print(_apply_sfstr_format(_last_fmt_parts, _fmt_result(res)))
             continue
 
 
@@ -1719,6 +1857,11 @@ try:
         fixed_inline = set()
         if inline_str:
             cur_vars = apply_inline(inline_str, all_vars, cur_vars, ISO_INLINE, fixed=fixed_inline, track_resolved=resolved_names, base_vals=resolved_base_vals)
+
+        if _inline_error[0]:
+            print(_inline_error[0])
+            _inline_error[0] = None
+            continue
 
         ask_items   = [('det', v) for v in det_vars if v not in cur_vars]
         ask_history = []
@@ -1808,7 +1951,7 @@ try:
         res = _resolve(exp, cur_vars, resolved_names)
         if res is _ABORT or res is _BACK: continue
         if isinstance(res, Lambda) and not assigned_set: _last_lambda[0] = res
-        print(_fmt_result(res))
+        print(_apply_sfstr_format(_last_fmt_parts, _fmt_result(res)))
 
 
         if not det_vars and not resolved_names and not asked_sub_keys:
@@ -1829,7 +1972,7 @@ try:
                 res = _resolve(exp, cur_vars, resolved_names)
                 if res is _ABORT or res is _BACK: break
                 if isinstance(res, Lambda) and not assigned_set: _last_lambda[0] = res
-                print(_fmt_result(res)); continue
+                print(_apply_sfstr_format(_last_fmt_parts, _fmt_result(res))); continue
 
             inp = _strip_spaces(inp)
             just_set = set()
@@ -1882,7 +2025,7 @@ try:
             res = _resolve(exp, cur_vars, resolved_names)
             if res is _ABORT or res is _BACK: break
             if isinstance(res, Lambda) and not assigned_set: _last_lambda[0] = res
-            print(_fmt_result(res))
+            print(_apply_sfstr_format(_last_fmt_parts, _fmt_result(res)))
 except EOFError:
     print("(Quit)")
     exit()
