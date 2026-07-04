@@ -89,6 +89,8 @@ class SubProxy:
 
 class _DisplayDec(dec):
     def __str__(self):
+        if self.is_nan():      return 'nan'
+        if self.is_infinite(): return 'inf' if self > 0 else '-inf'
         s, d, e = self.as_tuple()
         order = e + len(d) - 1
         if e < 0 and abs(order) < DISPLAY_PREC:
@@ -460,7 +462,7 @@ class Lambda:
     def __pos__(self):         return Lambda(self.expr, self.params)
 
     def __repr__(self):
-        return f'{GREEN}"{self.expr}"{RST}'
+        return f'"{self.expr}"'
     def __str__(self):
         return self.__repr__()
 
@@ -872,7 +874,7 @@ Inline: e.g. x=0 (when setting a variable) / f=\"sin(x)\"; f(rad(x)){RST}\n""")
 
 def _display(result: dec) -> dec:
     if result.is_infinite() or result.is_nan():
-        return result
+        return _DisplayDec(result)
     if result == 0:
         return _DisplayDec(0)
 
@@ -1069,7 +1071,7 @@ def _normalize_sub_key(key: str) -> str:
     return key
 
 
-def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = False):
+def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = False, allow_inf: bool = False):
     if v_dict is None:
         v_dict = {}
 
@@ -1122,7 +1124,9 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
             env[base] = SubProxy(base, env, env.get(base))
 
         try:
-            raw = eval(fin, {"__builtins__": {}}, env)
+            with decimal.localcontext(ctx) as _lctx:
+                _lctx.traps[decimal.InvalidOperation] = False
+                raw = eval(fin, {"__builtins__": {}}, env)
 
 
             if isinstance(raw, Lambda):
@@ -1149,20 +1153,21 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
             if isinstance(raw, mpmath.mpf):
                 if mpmath.isinf(raw):
                     if chk: return dec(1)
-                    return _fmt_error("Result infinite (positive)." if raw > 0 else "Result infinite (negative).")
+                    if not allow_inf:
+                        return ("inf" if raw > 0 else "-inf")
                 if mpmath.isnan(raw):
                     if chk: return dec(1)
-                    return _fmt_error("Result not a number.")
                 raw = dec(mpmath.nstr(raw, mpmath.mp.dps))
             elif not isinstance(raw, dec):
                 raw = dec(str(raw))
             if isinstance(raw, dec):
                 if raw.is_infinite():
                     if chk: return dec(1)
-                    return _fmt_error("Result infinite (positive)." if raw > 0 else "Result infinite (negative).")
+                    if not allow_inf:
+                        return ("inf" if raw > 0 else "-inf")
                 if raw.is_nan():
                     if chk: return dec(1)
-                    return _fmt_error("Result not a number.")
+                    return ("nan")
             return raw if nodisplay else _display(raw)
 
         except SyntaxError:
@@ -1664,7 +1669,7 @@ def apply_inline(inline_str: str, all_vars: list, base: dict, isolate: bool, rep
             continue
         if fixed is not None and tgt in fixed:
             continue
-        ev = run(cal, val, work)
+        ev = run(cal, val, work, allow_inf=True)
         if ev is _ABORT or ev is _BACK: break
         if isinstance(ev, str) and _UNDEF_RE.search(ev):
             prev_len = len(track_resolved) if track_resolved is not None else 0
@@ -1752,14 +1757,14 @@ def _ask_value(name, cur_vars):
         if actions(inp): continue
         if inp.lower() == 'new': return _ABORT
         if inp.lower() == 'back': return _BACK
-        r = _resolve(inp, cur_vars)
+        r = _resolve(inp, cur_vars, allow_inf=True)
         if r is _ABORT or r is _BACK or isinstance(r, (dec, Lambda, mpmath.mpc)):
             return r
         print(r)
 
 
-def _resolve(expr_str, cur_vars, resolved=None):
-    ev = run(cal, expr_str, cur_vars)
+def _resolve(expr_str, cur_vars, resolved=None, allow_inf=False):
+    ev = run(cal, expr_str, cur_vars, allow_inf=allow_inf)
     if ev is _ABORT or ev is _BACK: return ev
     for _ in range(20):
         if isinstance(ev, _MissingArgs):
@@ -1785,7 +1790,7 @@ def _resolve(expr_str, cur_vars, resolved=None):
                 cur_vars[m.group(1)] = val
                 if resolved is not None and m.group(1) not in resolved:
                     resolved.append(m.group(1))
-                ev = run(cal, expr_str, cur_vars)
+                ev = run(cal, expr_str, cur_vars, allow_inf=allow_inf)
                 if ev is _ABORT or ev is _BACK: return ev
                 continue
         break
