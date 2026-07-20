@@ -17,6 +17,7 @@ GUARD_DIGITS = 20
 IMG          = True
 
 RED    = "\x1b[38;2;255;0;0m"
+DRED    = "\x1b[38;2;104;0;0m"
 YELLOW = "\x1b[38;2;204;204;0m"
 BRBL   = "\x1b[38;2;0;150;255m"
 LSBL   = "\x1b[38;2;94;140;255m"
@@ -120,8 +121,6 @@ def get_sub_specs(s: str) -> list:
                     if depth == 0: break
                 j += 1
             index_toks = tokens[i+2:j]
-            if len(index_toks) == 1 and index_toks[0].type == _TOK_SFSTRING:
-                i = j + 1; continue
             index_expr = ''.join(tk.string for tk in index_toks)
             key = (t.string, index_expr)
             if key not in seen:
@@ -247,6 +246,26 @@ def _is_sfstr(s: str) -> bool:
 def _sfstr_inner(s: str) -> str:
     return _mangled_to_sfstr.get(s, s)
 
+def _strip_sfstrings(tokens: list):
+    fmt_parts = []
+    value_tokens = []
+    for i, t in enumerate(tokens):
+        if t.type == _TOK_SFSTRING:
+            is_subscript_key = (i >= 2 and tokens[i-1].string == '[' and
+                                 (tokens[i-2].type == tokenize.NAME or
+                                  tokens[i-2].string in (')', ']', '}')))
+            if is_subscript_key:
+                value_tokens.append(t)
+                if not fmt_parts or fmt_parts[-1][0] != 'value':
+                    fmt_parts.append(('value',))
+            else:
+                fmt_parts.append(('sfstr', _sfstr_inner(t.string)))
+        else:
+            value_tokens.append(t)
+            if not fmt_parts or fmt_parts[-1][0] != 'value':
+                fmt_parts.append(('value',))
+    return fmt_parts, value_tokens
+
 def _catkey(*args):
     parts = []
     for a in args:
@@ -258,7 +277,64 @@ def _catkey(*args):
             parts.append(str(a))
     return ''.join(parts)
 
+def _apply_pipes(tokens: list) -> list:
+    n = len(tokens)
+    is_pipe = [t.type == tokenize.OP and t.string == '|' for t in tokens]
+    if not any(is_pipe):
+        return tokens
+
+    roles = [None] * n
+    prev_kind = None
+    stack = 0
+    for idx, t in enumerate(tokens):
+        if is_pipe[idx]:
+            if prev_kind in (None, 'op'):
+                roles[idx] = 'open'
+                stack += 1
+                prev_kind = 'op'
+            elif stack > 0:
+                roles[idx] = 'close'
+                stack -= 1
+                prev_kind = 'value'
+            else:
+                roles[idx] = 'open'
+                stack += 1
+                prev_kind = 'op'
+        else:
+            if t.type in (tokenize.NUMBER, _TOK_STRING, _TOK_SFSTRING) or t.string in (')', ']', '}'):
+                prev_kind = 'value'
+            elif t.type == tokenize.NAME:
+                prev_kind = 'value'
+            else:
+                prev_kind = 'op'
+
+    if stack != 0:
+        return tokens
+
+    out = []
+    for idx, t in enumerate(tokens):
+        if is_pipe[idx]:
+            if roles[idx] == 'open':
+                out.append(Tok(tokenize.NAME, 'abs'))
+                out.append(Tok(tokenize.OP, '('))
+            else:
+                out.append(Tok(tokenize.OP, ')'))
+        else:
+            out.append(t)
+    return out
+
+_ANCHOR_RE = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)\[\s*(-)?\s*\binf\b\s*([+\-]\s*[^\[\]]*)?\]')
+
+def _preprocess_set_anchors(s: str) -> str:
+    def repl(m):
+        base, neg, off = m.group(1), m.group(2), m.group(3)
+        offset = off.strip() if off else '+0'
+        fn = 'setanchorlo' if neg else 'setanchorhi'
+        return f'{fn}({base},{offset})'
+    return _ANCHOR_RE.sub(repl, s)
+
 def get_clean_tokens(s: str) -> list:
+    s = _preprocess_set_anchors(s)
     s = _preprocess_lv(s)
     s = re.sub(r'(\d)(_[A-Za-z])', r'\1 \2', s)
     raw_tokens = []
@@ -341,74 +417,103 @@ def get_clean_tokens(s: str) -> list:
         else:
             merged.append(t0)
             i += 1
-    return merged
+    return _apply_pipes(merged)
+
+
+def _scan_vars(tokens: list, lo: int, hi: int, found: set, seen: list):
+    i = lo
+    while i < hi:
+        t = tokens[i]
+        if t.type == tokenize.NAME and i + 1 < hi and tokens[i+1].string == '[':
+            j = i + 2
+            depth = 1
+            while j < hi:
+                if   tokens[j].string == '[': depth += 1
+                elif tokens[j].string == ']':
+                    depth -= 1
+                    if depth == 0: break
+                j += 1
+            _scan_vars(tokens, i + 2, j, found, seen)
+            i = j + 1
+            continue
+        if t.string == '[':
+            prev = tokens[i-1] if i > lo else None
+            is_subscript = prev is not None and prev.string in (')', ']', '}')
+            j = i + 1
+            depth = 1
+            while j < hi:
+                if   tokens[j].string == '[': depth += 1
+                elif tokens[j].string == ']':
+                    depth -= 1
+                    if depth == 0: break
+                j += 1
+            if is_subscript:
+                _scan_vars(tokens, i + 1, j, found, seen)
+            i = j + 1
+            continue
+        if t.type == tokenize.NAME:
+            if (len(t.string) == 1 and t.string not in dco) or _is_longvar(t.string):
+                if t.string not in found:
+                    found.add(t.string); seen.append(t.string)
+        i += 1
 
 
 def getv(s: str) -> list:
     seen = []
     found = set()
     tokens = get_clean_tokens(s)
-    i = 0
-    while i < len(tokens):
+    _scan_vars(tokens, 0, len(tokens), found, seen)
+    return seen
+
+
+def _scan_lambda_params(tokens: list, lo: int, hi: int, found: set, seen: list):
+    i = lo
+    while i < hi:
         t = tokens[i]
+        if t.type == tokenize.NAME and i + 1 < hi and tokens[i+1].string == '[':
+            j = i + 2
+            depth = 1
+            while j < hi:
+                if   tokens[j].string == '[': depth += 1
+                elif tokens[j].string == ']':
+                    depth -= 1
+                    if depth == 0: break
+                j += 1
+            idx_toks = tokens[i+2:j]
+            _scan_lambda_params(tokens, i + 2, j, found, seen)
+            if len(idx_toks) == 1 and idx_toks[0].type == tokenize.NUMBER:
+                k = f"{t.string}[{idx_toks[0].string}]"
+                if k not in found:
+                    found.add(k); seen.append(k)
+            i = j + 1
+            continue
+        if t.string == '[':
+            prev = tokens[i-1] if i > lo else None
+            is_subscript = prev is not None and prev.string in (')', ']', '}')
+            j = i + 1
+            depth = 1
+            while j < hi:
+                if   tokens[j].string == '[': depth += 1
+                elif tokens[j].string == ']':
+                    depth -= 1
+                    if depth == 0: break
+                j += 1
+            if is_subscript:
+                _scan_lambda_params(tokens, i + 1, j, found, seen)
+            i = j + 1
+            continue
         if t.type == tokenize.NAME:
-            if (i + 1 < len(tokens) and
-                    tokens[i+1].type == tokenize.OP and
-                    tokens[i+1].string == '['):
-                j = i + 2
-                depth = 1
-                while j < len(tokens):
-                    if   tokens[j].string == '[': depth += 1
-                    elif tokens[j].string == ']':
-                        depth -= 1
-                        if depth == 0: break
-                    j += 1
-                for it in tokens[i+2:j]:
-                    if it.type == tokenize.NAME:
-                        if ((len(it.string) == 1 and it.string not in dco) or _is_longvar(it.string)) and it.string not in found:
-                            found.add(it.string); seen.append(it.string)
-                i = j + 1
-                continue
-            elif (len(t.string) == 1 and t.string not in dco) or _is_longvar(t.string):
+            if (len(t.string) == 1 and t.string not in dco) or _is_longvar(t.string):
                 if t.string not in found:
                     found.add(t.string); seen.append(t.string)
         i += 1
-    return seen
+
 
 def _get_lambda_params(expr: str) -> list:
     seen = []
     found = set()
     tokens = get_clean_tokens(expr)
-    i = 0
-    while i < len(tokens):
-        t = tokens[i]
-        if t.type == tokenize.NAME:
-            if (i + 1 < len(tokens) and
-                    tokens[i+1].type == tokenize.OP and
-                    tokens[i+1].string == '['):
-                j = i + 2
-                depth = 1
-                while j < len(tokens):
-                    if   tokens[j].string == '[': depth += 1
-                    elif tokens[j].string == ']':
-                        depth -= 1
-                        if depth == 0: break
-                    j += 1
-                idx_toks = tokens[i+2:j]
-                for it in idx_toks:
-                    if it.type == tokenize.NAME:
-                        if ((len(it.string) == 1 and it.string not in dco) or _is_longvar(it.string)) and it.string not in found:
-                            found.add(it.string); seen.append(it.string)
-                if len(idx_toks) == 1 and idx_toks[0].type == tokenize.NUMBER:
-                    k = f"{t.string}[{idx_toks[0].string}]"
-                    if k not in found:
-                        found.add(k); seen.append(k)
-                i = j + 1
-                continue
-            elif (len(t.string) == 1 and t.string not in dco) or _is_longvar(t.string):
-                if t.string not in found:
-                    found.add(t.string); seen.append(t.string)
-        i += 1
+    _scan_lambda_params(tokens, 0, len(tokens), found, seen)
     return seen
 
 
@@ -465,6 +570,200 @@ class Lambda:
         return f'"{self.expr}"'
     def __str__(self):
         return self.__repr__()
+
+
+class SetObj:
+    __slots__ = ('kind', 'values', 'clauses', 'rows', 'cols')
+
+    def __init__(self, kind, values=None, clauses=None, rows=None, cols=None):
+        self.kind    = kind
+        self.values  = values
+        self.clauses = clauses
+        self.rows    = rows
+        self.cols    = cols
+
+    def _bounds(self):
+        if self.kind == 'ineq':
+            los = [c[0] for c in self.clauses]
+            his = [c[2] for c in self.clauses]
+            return min(los), max(his)
+        if self.kind in ('list', 'range', 'zeros'):
+            return dec(0), dec(len(self.values) - 1)
+        return dec('-Infinity'), dec('Infinity')
+
+    def _bounds_incl(self):
+        L, U = self._bounds()
+        L_incl = any(c[0] == L and c[1] for c in self.clauses)
+        U_incl = any(c[2] == U and c[3] for c in self.clauses)
+        return L, L_incl, U, U_incl
+
+    def _matching_clause(self, v):
+        for cl in self.clauses:
+            lo, lo_i, hi, hi_i, override = cl
+            ok_lo = v >= lo if lo_i else v > lo
+            ok_hi = v <= hi if hi_i else v < hi
+            if ok_lo and ok_hi:
+                return cl
+        return None
+
+    def _intersect(self, other):
+        L, U = self._bounds()
+        clauses = other.clauses if other.kind == 'ineq' else [(dec(0), True, dec(len(other.values) - 1), True, None)]
+        result = []
+        for lo2, lo2_i, hi2, hi2_i, label2 in clauses:
+            lo, lo_i = (L, True) if L > lo2 else (lo2, lo2_i)
+            hi, hi_i = (U, True) if U < hi2 else (hi2, hi2_i)
+            if lo < hi or (lo == hi and lo_i and hi_i):
+                result.append((lo, lo_i, hi, hi_i, None))
+        if not result:
+            result = [(dec(0), True, dec(0), False, None)]
+        return SetObj('ineq', clauses=result)
+
+    def __getitem__(self, key):
+        if self.kind == 'zeros2d':
+            if not isinstance(key, tuple) or len(key) != 2:
+                return _fmt_error("2D Set requires two indices: s[r,c]")
+            r, c = key
+            r = r if isinstance(r, dec) else dec(str(r))
+            c = c if isinstance(c, dec) else dec(str(c))
+            r = int(r.to_integral_value(rounding=decimal.ROUND_HALF_UP)) % self.rows
+            c = int(c.to_integral_value(rounding=decimal.ROUND_HALF_UP)) % self.cols
+            return dec(0)
+
+        if isinstance(key, SetObj):
+            return self._intersect(key)
+
+        if isinstance(key, tuple):
+            return _make_set_list(*[self[k] for k in key])
+
+        if isinstance(key, mpmath.mpc):
+            if abs(key.imag) > 1e-30:
+                return _fmt_error("Set indices must be real.")
+            key = dec(mpmath.nstr(key.real, mpmath.mp.dps))
+
+        v = key if isinstance(key, dec) else dec(str(key))
+
+        if self.kind == 'ineq':
+            cl = self._matching_clause(v)
+            if cl is not None:
+                result, fmt_parts = v, cl[4]
+            else:
+                L, L_incl, U, U_incl = self._bounds_incl()
+                if U.is_infinite() and L.is_infinite():
+                    result = v
+                elif U.is_infinite():
+                    result = U
+                elif L.is_infinite():
+                    result = L
+                else:
+                    width = U - L
+                    offset = (v - L) % width
+                    if offset < 0:
+                        offset += width
+                    if offset == 0:
+                        result = U if U_incl else U.next_minus(context=decimal.Context(prec=DISPLAY_PREC))
+                    else:
+                        result = L + offset
+                fmt_parts = next((c[4] for c in self.clauses if c[4] is not None), None)
+            if fmt_parts is not None:
+                return _apply_sfstr_format(fmt_parts, _fmt_element(result))
+            return result
+
+        n = len(self.values)
+        if n == 0:
+            return _fmt_error("Set is empty.")
+        idx = int(v.to_integral_value(rounding=decimal.ROUND_HALF_UP)) % n
+        item = self.values[idx]
+        if isinstance(item, _FmtVal):
+            return _apply_sfstr_format(item.fmt_parts, _fmt_element(item.value))
+        return item
+
+    def __repr__(self):
+        if self.kind == 'ineq':
+            parts = []
+            for lo, lo_i, hi, hi_i, fmt_parts in self.clauses:
+                seg = ''
+                if not (lo.is_infinite() and lo < 0):
+                    seg += ('>=' if lo_i else '>') + str(_display(lo))
+                if not (hi.is_infinite() and hi > 0):
+                    seg += ('<=' if hi_i else '<') + str(_display(hi))
+                if fmt_parts is not None:
+                    texts = [p[1] for p in fmt_parts if p[0] == 'sfstr']
+                    if texts:
+                        seg += '[' + ''.join(texts) + ']'
+                parts.append(seg)
+            return '{' + ','.join(parts) + '}'
+        if self.kind == 'zeros2d':
+            return f'zeros({self.rows},{self.cols})'
+        def fmt_val(v):
+            if isinstance(v, _FmtVal):
+                texts = [p[1] for p in v.fmt_parts if p[0] == 'sfstr']
+                return _fmt_element(v.value) + '[' + ''.join(texts) + ']'
+            return _fmt_element(v)
+        return '{' + ','.join(fmt_val(v) for v in self.values) + '}'
+
+    def __str__(self):
+        return self.__repr__()
+
+
+class _FmtVal:
+    __slots__ = ('value', 'fmt_parts')
+    def __init__(self, value, fmt_parts):
+        self.value = value
+        self.fmt_parts = fmt_parts
+
+def _make_fmtval(value, fmt_parts):
+    return _FmtVal(value, fmt_parts)
+
+
+def _split_ineq_clause(tokens: list):
+    op1 = tokens[0].string
+    j = 1
+    while j < len(tokens) and tokens[j].string not in _CMP_OPS:
+        j += 1
+    val1 = tokens[1:j]
+    if j < len(tokens):
+        return op1, val1, tokens[j].string, tokens[j+1:]
+    return op1, val1, None, None
+
+
+def _reconstruct_label_text(tokens: list) -> str:
+    parts = []
+    for t in tokens:
+        if t.type == _TOK_SFSTRING:
+            parts.append('[' + _sfstr_inner(t.string) + ']')
+        elif t.type == _TOK_STRING:
+            parts.append('"' + t.string.replace('"', '\\"') + '"')
+        else:
+            parts.append(t.string)
+    return ''.join(parts)
+
+
+def _make_clause(op1, v1, op2, v2, fmt_parts):
+    v1 = v1 if isinstance(v1, dec) else dec(str(v1))
+    lo, hi = dec('-Infinity'), dec('Infinity')
+    lo_i, hi_i = True, True
+    if op1 in ('>=', '>'):
+        lo, lo_i = v1, (op1 == '>=')
+    else:
+        hi, hi_i = v1, (op1 == '<=')
+    if op2:
+        v2 = v2 if isinstance(v2, dec) else dec(str(v2))
+        if op2 in ('>=', '>'):
+            lo, lo_i = v2, (op2 == '>=')
+        else:
+            hi, hi_i = v2, (op2 == '<=')
+    return (lo, lo_i, hi, hi_i, fmt_parts)
+
+
+def _make_set_ineq(*clauses):
+    parsed = [_make_clause(*c) for c in clauses]
+    for lo, lo_i, hi, hi_i, override in parsed:
+        if lo > hi or (lo == hi and not (lo_i and hi_i)):
+            return _fmt_error("Set clause has no valid range (e.g. '>10<0' \u2014 did you mean a comma for union, like '>10,<0'?)")
+    return SetObj('ineq', clauses=parsed)
+
+    
 
 
 dco = {
@@ -546,6 +845,8 @@ dco['mpf'] = lambda x: mpmath.mpf(str(x))
 dco['mpc'] = lambda r, i: mpmath.mpc(str(r), str(i))
 dco['i'] = mpmath.mpc(0, 1)
 dco['cat'] = _catkey
+dco['true'] = True
+dco['false'] = False
 
 
 def _to_dec(v):
@@ -687,6 +988,55 @@ def _run_lambda(*args):
     call_args = [vals[i % len(vals)] for i in range(len(f.params))]
     return f(*call_args)
 dco['run'] = _run_lambda
+
+
+def _make_set_list(*vals):
+    conv = []
+    for v in vals:
+        if isinstance(v, mpmath.mpf):
+            v = dec(mpmath.nstr(v, mpmath.mp.dps))
+        conv.append(v)
+    return SetObj('list', values=conv)
+
+
+def _zeros(*args):
+    if len(args) == 1:
+        n = int(args[0])
+        return SetObj('zeros', values=[dec(0)] * n)
+    if len(args) == 2:
+        rows, cols = int(args[0]), int(args[1])
+        return SetObj('zeros2d', rows=rows, cols=cols)
+    return _fmt_error("zeros() takes 1 or 2 arguments: zeros(n) or zeros(rows, cols)")
+dco['zeros'] = _zeros
+
+
+def _range_set(*args):
+    if len(args) == 1:
+        n = int(args[0])
+        return SetObj('range', values=[dec(k) for k in range(n)])
+    if len(args) == 2:
+        start, stop = int(args[0]), int(args[1])
+        return SetObj('range', values=[dec(k) for k in range(start, stop)])
+    return _fmt_error("range() takes 1 or 2 arguments: range(n) or range(start, stop)")
+dco['range'] = _range_set
+
+
+def _set_anchor_lo(base, offset):
+    if not isinstance(base, SetObj):
+        return _fmt_error("inf-anchor indexing can only be used on a Set.")
+    L, _ = base._bounds()
+    off = offset if isinstance(offset, dec) else dec(str(offset))
+    return L + off
+dco['setanchorlo'] = _set_anchor_lo
+
+
+def _set_anchor_hi(base, offset):
+    if not isinstance(base, SetObj):
+        return _fmt_error("inf-anchor indexing can only be used on a Set.")
+    _, U = base._bounds()
+    off = offset if isinstance(offset, dec) else dec(str(offset))
+    return U + off
+dco['setanchorhi'] = _set_anchor_hi
 
 
 def _simp(node):
@@ -926,6 +1276,9 @@ _last_lambda: list  = [None]
 def _fmt_error(msg: str) -> str:
     return f"{RED}{msg}{RST}"
 
+def _fmt_error_info(msg: str) -> str:
+    return f"{DRED}{msg}{RST}"
+
 
 if len(sys.argv) <= 1:
     print(f"""Arbitrary-precision mathematical expression REPL.
@@ -982,11 +1335,20 @@ def _fmt_result(v):
     return str(v)
 
 
+def _fmt_element(v):
+    if isinstance(v, dec):
+        v = _display(v)
+    return _fmt_result(v)
+
+
 def _tok_text(t):
     if t.type == tokenize.NUMBER:
         if t.string.lower().endswith('j'):
             coeff = t.string[:-1] or '1'
             return f'mpmath.mpc(0, mpmath.mpf("{coeff}"))'
+        low = t.string.lower()
+        if low.startswith('0b') or low.startswith('0o') or low.startswith('0x'):
+            return f'dec({t.string})'
         return f'dec("{t.string}")'
     if t.type == _TOK_STRING:
         safe = t.string.replace('\\', '\\\\').replace('"', '\\"')
@@ -998,10 +1360,10 @@ def _tok_text(t):
 
 
 def _needs_mul(prev, curr, prev_name, v_dict):
-    prev_is_value  = prev.type in (tokenize.NUMBER, _TOK_STRING) or prev.string in (')', ']')
+    prev_is_value  = prev.type in (tokenize.NUMBER, _TOK_STRING) or prev.string in (')', ']', '}')
     prev_is_name   = prev.type == tokenize.NAME
     prev_is_sfstr  = prev.type == _TOK_SFSTRING
-    curr_is_value  = curr.type in (tokenize.NUMBER, _TOK_STRING) or curr.string == '('
+    curr_is_value  = curr.type in (tokenize.NUMBER, _TOK_STRING) or curr.string in ('(', '{')
     curr_is_name   = curr.type == tokenize.NAME
     curr_is_string = curr.type == _TOK_STRING
     curr_is_sfstr  = curr.type == _TOK_SFSTRING
@@ -1023,7 +1385,7 @@ def _needs_mul(prev, curr, prev_name, v_dict):
 
 
 def _is_naked(prev_last, curr_first, v_dict):
-    if curr_first.string not in ('(', '['):
+    if curr_first.string not in ('(', '[', '{'):
         return False
     if prev_last.type != tokenize.NAME:
         return False
@@ -1035,6 +1397,21 @@ def _group_tokens(tokens: list, lo: int, hi: int, v_dict: dict, in_subscript: bo
     i = lo
     while i < hi:
         t = tokens[i]
+        if t.string == '{':
+            depth = 1
+            j = i + 1
+            while j < hi and depth > 0:
+                if   tokens[j].string == '{': depth += 1
+                elif tokens[j].string == '}':
+                    depth -= 1
+                    if depth == 0: break
+                j += 1
+            if depth != 0:
+                raise SyntaxError("unclosed '{'")
+            set_src = _build_set_source(tokens[i+1:j], v_dict)
+            atoms.append((set_src, t, tokens[j]))
+            i = j + 1
+            continue
         if t.string in ('(', '['):
             open_ch  = t.string
             close_ch = ')' if open_ch == '(' else ']'
@@ -1044,7 +1421,10 @@ def _group_tokens(tokens: list, lo: int, hi: int, v_dict: dict, in_subscript: bo
                 if   tokens[j].string == open_ch:  depth += 1
                 elif tokens[j].string == close_ch: depth -= 1
                 j += 1
-            inner = _group_tokens(tokens, i + 1, j - 1, v_dict, in_subscript=(open_ch == '['))
+            if open_ch == '[' and i + 1 < j - 1 and tokens[i+1].string in _CMP_OPS:
+                inner = _build_set_source(tokens[i+1:j-1], v_dict)
+            else:
+                inner = _group_tokens(tokens, i + 1, j - 1, v_dict, in_subscript=(open_ch == '['))
             atoms.append((open_ch + inner + close_ch, t, tokens[j - 1]))
             i = j
         else:
@@ -1097,11 +1477,77 @@ def _group_tokens(tokens: list, lo: int, hi: int, v_dict: dict, in_subscript: bo
     return ''.join(pieces)
 
 
+_CMP_OPS = ('>=', '<=', '>', '<')
+
+
+def _split_tokens_top_level(tokens: list, sep: str) -> list:
+    parts, current, depth = [], [], 0
+    for t in tokens:
+        if t.string in ('(', '[', '{'):
+            depth += 1; current.append(t)
+        elif t.string in (')', ']', '}'):
+            depth -= 1; current.append(t)
+        elif t.string == sep and depth == 0:
+            parts.append(current); current = []
+        else:
+            current.append(t)
+    parts.append(current)
+    return parts
+
+
+def _build_set_source(tokens: list, v_dict: dict) -> str:
+    if not tokens:
+        return '_make_set_list()'
+    segs = [seg for seg in _split_tokens_top_level(tokens, ',') if seg]
+    if not segs:
+        return '_make_set_list()'
+
+    parsed_segs = []
+    for seg in segs:
+        fmt_parts, value_tokens = _strip_sfstrings(seg)
+        has_fmt = any(p[0] == 'sfstr' for p in fmt_parts)
+        is_clause = bool(value_tokens) and value_tokens[0].string in _CMP_OPS
+        parsed_segs.append((is_clause, has_fmt, fmt_parts, value_tokens))
+
+    all_ineq = bool(parsed_segs) and all(p[0] for p in parsed_segs)
+
+    if all_ineq:
+        clause_srcs = []
+        for is_clause, has_fmt, fmt_parts, value_tokens in parsed_segs:
+            op1, val1, op2, val2 = _split_ineq_clause(value_tokens)
+            v1 = _group_tokens(val1, 0, len(val1), v_dict) if val1 else '0'
+            fsrc = repr(fmt_parts) if has_fmt else 'None'
+            if op2:
+                v2 = _group_tokens(val2, 0, len(val2), v_dict) if val2 else '0'
+                clause_srcs.append(f"('{op1}',({v1}),'{op2}',({v2}),{fsrc})")
+            else:
+                clause_srcs.append(f"('{op1}',({v1}),None,None,{fsrc})")
+        return f"_make_set_ineq({','.join(clause_srcs)})"
+
+    seg_srcs = []
+    for is_clause, has_fmt, fmt_parts, value_tokens in parsed_segs:
+        if is_clause:
+            op1, val1, op2, val2 = _split_ineq_clause(value_tokens)
+            v1 = _group_tokens(val1, 0, len(val1), v_dict) if val1 else '0'
+            op2_src = f"'{op2}'" if op2 else 'None'
+            v2_src = f"({_group_tokens(val2, 0, len(val2), v_dict) if val2 else '0'})" if op2 else 'None'
+            fsrc = repr(fmt_parts) if has_fmt else 'None'
+            seg_srcs.append(f"_make_set_ineq(('{op1}',({v1}),{op2_src},{v2_src},{fsrc}))")
+        elif has_fmt and not value_tokens:
+            continue
+        elif has_fmt:
+            value_src = _group_tokens(value_tokens, 0, len(value_tokens), v_dict)
+            seg_srcs.append(f"_make_fmtval({value_src},{repr(fmt_parts)})")
+        else:
+            seg_srcs.append(_group_tokens(value_tokens, 0, len(value_tokens), v_dict))
+    return f"_make_set_list({','.join(seg_srcs)})"
+
+
 _last_fmt_parts: list = [('value',)]
 
 
 def _extract_format_sfstrings(tokens: list):
-    fmt_parts = []; cleaned = []; bracket_depth = 0; paren_depth = 0
+    fmt_parts = []; cleaned = []; bracket_depth = 0; paren_depth = 0; brace_depth = 0
     for t in tokens:
         if t.string == '[':
             bracket_depth += 1; cleaned.append(t)
@@ -1113,14 +1559,19 @@ def _extract_format_sfstrings(tokens: list):
         elif t.string == ')':
             if paren_depth > 0: paren_depth -= 1
             cleaned.append(t)
+        elif t.string == '{':
+            brace_depth += 1; cleaned.append(t)
+        elif t.string == '}':
+            if brace_depth > 0: brace_depth -= 1
+            cleaned.append(t)
         elif t.type == _TOK_SFSTRING:
-            if bracket_depth > 0 or paren_depth > 0:
+            if bracket_depth > 0 or paren_depth > 0 or brace_depth > 0:
                 cleaned.append(t)
             else:
                 fmt_parts.append(('sfstr', _sfstr_inner(t.string)))
         else:
             cleaned.append(t)
-            if bracket_depth == 0 and paren_depth == 0 and (not fmt_parts or fmt_parts[-1][0] != 'value'):
+            if bracket_depth == 0 and paren_depth == 0 and brace_depth == 0 and (not fmt_parts or fmt_parts[-1][0] != 'value'):
                 fmt_parts.append(('value',))
     return cleaned, fmt_parts
 
@@ -1165,7 +1616,7 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
                     tokens[idx+2].type == _TOK_STRING):
                 return _fmt_error("The given expression has invalid syntax.")
 
-        env = {**dco, **{k: (dec(v) if isinstance(v, _DisplayDec) else v) for k, v in v_dict.items()}, 'dec': dec, 'mpmath': mpmath, 'Lambda': Lambda}
+        env = {**dco, **{k: (dec(v) if isinstance(v, _DisplayDec) else v) for k, v in v_dict.items()}, 'dec': dec, 'mpmath': mpmath, 'Lambda': Lambda, '_make_set_list': _make_set_list, '_make_set_ineq': _make_set_ineq, '_make_fmtval': _make_fmtval}
 
         for idx in range(len(tokens) - 2):
             t0, t1, t2 = tokens[idx], tokens[idx+1], tokens[idx+2]
@@ -1187,7 +1638,8 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
         for _i2 in range(len(tokens) - 1):
             if (tokens[_i2].type == tokenize.NAME and
                     tokens[_i2].string not in dco and
-                    tokens[_i2+1].string == '['):
+                    tokens[_i2+1].string == '[' and
+                    not isinstance(env.get(tokens[_i2].string), SetObj)):
                 sub_bases.add(tokens[_i2].string)
         for base in sub_bases:
             env[base] = SubProxy(base, env, env.get(base))
@@ -1202,6 +1654,9 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
                 return raw
 
             if isinstance(raw, _MissingArgs):
+                return raw
+
+            if isinstance(raw, SetObj):
                 return raw
 
             if isinstance(raw, str):
@@ -1239,38 +1694,39 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
                     return ("nan")
             return raw if nodisplay else _display(raw)
 
-        except SyntaxError:
-            return _fmt_error("The given expression has invalid syntax.")
+        except SyntaxError as se:
+            serr = str(se).splitlines()[0]
+            return _fmt_error(f"Invalid syntax: {serr}\n")+_fmt_error_info(f"[{fin}]")
         except NameError as ne:
             if chk: return dec(1)
             name = getattr(ne, 'name', None) or (str(ne).split("'")[1] if "'" in str(ne) else "?")
-            return _fmt_error(f"'{name}' is not defined.")
+            return _fmt_error(f"'{name}' is not defined.\n")+_fmt_error_info(f"[{fin}]")
         except TypeError as te:
             if chk: return dec(1)
             terr = str(te).splitlines()[0]
-            return _fmt_error(f"Type error: {terr}")
+            return _fmt_error(f"Type error: {terr}\n")+_fmt_error_info(f"[{fin}]")
         except ZeroDivisionError:
             if chk: return dec(1)
-            return _fmt_error("Division by zero.")
+            return _fmt_error("Division by zero.\n")+_fmt_error_info(f"[{fin}]")
         except decimal.Overflow:
             if chk: return dec(1)
-            return _fmt_error("Result too large.")
+            return _fmt_error("Result too large.\n")+_fmt_error_info(f"[{fin}]")
         except decimal.InvalidOperation:
             if chk: return dec(1)
-            return _fmt_error("Invalid operation from input.")
+            return _fmt_error("Invalid operation from input.\n")+_fmt_error_info(f"[{fin}]")
         except ValueError as ve:
             if chk: return dec(1)
             verr = str(ve).splitlines()[0]
-            return _fmt_error(f"Value error: {verr}")
+            return _fmt_error(f"Value error: {verr}\n")+_fmt_error_info(f"[{fin}]")
         except OverflowError:
             if chk: return dec(1)
-            return _fmt_error("Numerical overflow.")
+            return _fmt_error("Numerical overflow.\n")+_fmt_error_info(f"[{fin}]")
         except Exception:
             if chk: return dec(1)
             raise
 
     except Exception as e:
-        return _fmt_error(f"Calculation problem: {e}")
+        return _fmt_error(f"Calculation problem: {e}\n")+_fmt_error_info(f"[{expr}]")
 
 
 def _parse_repeat(expr: str):
@@ -1532,14 +1988,25 @@ def _is_assign_target(lhs: str) -> bool:
             bool(re.match(r'^[A-Za-z_][A-Za-z0-9_]*\[XSFSTRx\d+x\]$', lhs)))
 
 
+_INEQ_ASSIGN_RE = re.compile(r'^([A-Za-z]|XLONGx\d+x)((?:>=|<=|>|<).*)$')
+
+def _parse_ineq_assignment(seg: str):
+    m = _INEQ_ASSIGN_RE.match(seg)
+    if not m:
+        return None
+    lhs, rest = m.group(1), m.group(2)
+    if not _is_assign_target(lhs):
+        return None
+    return lhs, '{' + rest + '}'
+
+
 def _parse_assignment(seg: str):
     eq = seg.find('=')
-    if eq == -1 or (eq + 1 < len(seg) and seg[eq + 1] == '='):
-        return None
-    lhs, rhs = seg[:eq].strip(), seg[eq + 1:].strip()
-    if _is_assign_target(lhs):
-        return lhs, rhs
-    return None
+    if eq != -1 and not (eq + 1 < len(seg) and seg[eq + 1] == '='):
+        lhs, rhs = seg[:eq].strip(), seg[eq + 1:].strip()
+        if _is_assign_target(lhs):
+            return lhs, rhs
+    return _parse_ineq_assignment(seg.strip())
 
 
 def _assign_targets(inline_str: str) -> set:
@@ -1579,6 +2046,12 @@ def sorta(s: str, allowed: list) -> list:
             tgt = tgt.strip()
             if tgt in allowed or re.match(r'^[A-Za-z_][A-Za-z0-9_]*\[\d+\]$', tgt) or re.match(r'^[A-Za-z_][A-Za-z0-9_]*\[XSFSTRx\d+x\]$', tgt):
                 tgt = _normalize_sub_key(tgt)
+                deps = [x for x in allowed if x in val]
+                pairs.append((tgt, val, deps))
+        else:
+            ineq = _parse_ineq_assignment(p.strip())
+            if ineq and ineq[0] in allowed:
+                tgt, val = ineq
                 deps = [x for x in allowed if x in val]
                 pairs.append((tgt, val, deps))
 
@@ -1646,9 +2119,9 @@ def apply_inline(inline_str: str, all_vars: list, base: dict, isolate: bool, rep
         if isinstance(ev, _SFStrResult):
             _inline_error[0] = _fmt_error("Invalid operation from input.")
             break
-        if isinstance(ev, (dec, Lambda, mpmath.mpc)):
+        if isinstance(ev, (dec, Lambda, mpmath.mpc, SetObj)):
             work[tgt] = ev
-            if isinstance(ev, Lambda):
+            if isinstance(ev, (Lambda, SetObj)):
                 _user_vars[tgt] = ev
         elif report:
             print(ev)
@@ -1657,27 +2130,30 @@ def apply_inline(inline_str: str, all_vars: list, base: dict, isolate: bool, rep
 
 def _strip_spaces(s: str) -> str:
     buf = []
-    in_str = False; str_char = ''; last_was_callable = False
+    in_str = False; str_char = ''
+    last_was_callable = False
+    prev_was_alnum = False
+    run_is_name = False
     i = 0
     while i < len(s):
         ch = s[i]
         if in_str:
             buf.append(ch)
             if ch == str_char: in_str = False
-            last_was_callable = True; i += 1
+            last_was_callable = True; prev_was_alnum = False; i += 1
         elif ch in ('"', "'"):
             in_str = True; str_char = ch; buf.append(ch)
-            last_was_callable = False; i += 1
+            last_was_callable = False; prev_was_alnum = False; i += 1
         elif ch == '_':
             j = s.find('_', i + 1)
             if j > i:
                 buf.append(_register_longvar(s[i+1:j]))
-                last_was_callable = True; i = j + 1
+                last_was_callable = True; prev_was_alnum = False; i = j + 1
             else:
-                buf.append('_'); last_was_callable = False; i += 1
+                buf.append('_'); last_was_callable = False; prev_was_alnum = False; i += 1
         elif ch == '[':
             if last_was_callable:
-                buf.append(ch); last_was_callable = False; i += 1
+                buf.append(ch); last_was_callable = False; prev_was_alnum = False; i += 1
             else:
                 depth = 1; j = i + 1
                 while j < len(s) and depth > 0:
@@ -1685,13 +2161,20 @@ def _strip_spaces(s: str) -> str:
                     elif s[j] == ']': depth -= 1
                     j += 1
                 buf.append(' '); buf.append(_register_sfstr(s[i+1:j-1])); buf.append(' ')
-                last_was_callable = False; i = j
-        elif ch in (')', ']'):
-            buf.append(ch); last_was_callable = True; i += 1
+                last_was_callable = False; prev_was_alnum = False; i = j
+        elif ch in (')', ']', '}'):
+            buf.append(ch); last_was_callable = True; prev_was_alnum = False; i += 1
+        elif ch.isalnum():
+            if not prev_was_alnum:
+                run_is_name = ch.isalpha()
+            buf.append(ch)
+            last_was_callable = run_is_name
+            prev_was_alnum = True
+            i += 1
         elif ch != ' ':
-            buf.append(ch); last_was_callable = ch.isalnum(); i += 1
+            buf.append(ch); last_was_callable = False; prev_was_alnum = False; i += 1
         else:
-            last_was_callable = False; i += 1
+            last_was_callable = False; prev_was_alnum = False; i += 1
     return re.sub(r'(XLONGx\d+x)(\d)', r'\1*\2', ''.join(buf))
 
 
@@ -1789,8 +2272,10 @@ def _ask_loop(exp: str, all_vars: list, det_vars: list, inline_str: str,
 
     while True:
         for base, index_expr in get_sub_specs(exp):
+            if isinstance(cur_vars.get(base), SetObj):
+                continue
             idx = cal(index_expr, cur_vars)
-            if not isinstance(idx, dec): continue
+            if not isinstance(idx, (dec, str)): continue
             key = _fmt_sub_key(base, idx)
             if key in seen_sub: continue
             seen_sub.add(key)
@@ -1827,7 +2312,7 @@ def _ask_loop(exp: str, all_vars: list, det_vars: list, inline_str: str,
             if ev is _BACK:  go_retry = True; break
             if ev is _ABORT: broken = True;   break
             if kind == 'det':
-                if isinstance(ev, Lambda):
+                if isinstance(ev, (Lambda, SetObj)):
                     cur_vars[v] = ev; _user_vars[v] = ev
                 elif isinstance(ev, (dec, mpmath.mpc)):
                     cur_vars[v] = ev
@@ -1886,16 +2371,16 @@ def _repeat_loop(exp: str, cur_vars: dict, resolved_names: list,
 
         inp = _strip_spaces(inp)
         just_set = user_updated = set()
-        if '=' in inp:
+        if '=' in inp or _INEQ_ASSIGN_RE.match(inp):
             assigns = sorta(inp, list(dict.fromkeys(all_vars + resolved_names)))
             if not assigns: continue
             err = abort = False; tmp = cur_vars.copy()
             for tgt, val in assigns:
                 ev = _resolve(val, tmp, resolved_names)
                 if ev is _ABORT or ev is _BACK: abort = True; break
-                if isinstance(ev, (dec, Lambda, mpmath.mpc)):
+                if isinstance(ev, (dec, Lambda, mpmath.mpc, SetObj)):
                     tmp[tgt] = ev
-                    if isinstance(ev, Lambda): _user_vars[tgt] = ev
+                    if isinstance(ev, (Lambda, SetObj)): _user_vars[tgt] = ev
                 else:
                     print(ev); err = True; break
             if abort: break
@@ -1909,10 +2394,10 @@ def _repeat_loop(exp: str, cur_vars: dict, resolved_names: list,
             ev = _resolve(inp, cur_vars, resolved_names)
             if ev is _ABORT: break
             if ev is _BACK: continue
-            if isinstance(ev, (dec, mpmath.mpc, Lambda)) and last_touched is not None:
+            if isinstance(ev, (dec, mpmath.mpc, Lambda, SetObj)) and last_touched is not None:
                 cur_vars[last_touched] = ev
                 user_updated = {last_touched}
-            elif isinstance(ev, (dec, mpmath.mpc, Lambda)):
+            elif isinstance(ev, (dec, mpmath.mpc, Lambda, SetObj)):
                 print(_fmt_result(ev)); continue
             elif isinstance(ev, str):
                 print(ev); continue
@@ -1939,18 +2424,16 @@ def evaluate(raw: str) -> None:
 
     if not exp:
         if inline_str:
-            all_vars          = getv(raw)
-            prev_lambda_keys  = {k for k, v in _user_vars.items() if isinstance(v, Lambda)}
-            tmp               = _user_vars.copy()
+            all_vars = getv(raw)
+            tmp      = _user_vars.copy()
+            shown    = False
             for tgt, val in sorta(inline_str, all_vars):
                 ev = cal(val, tmp)
-                if isinstance(ev, Lambda):
+                if isinstance(ev, (Lambda, SetObj)):
                     _user_vars[tgt] = ev; tmp[tgt] = ev
-            new_lambdas = [(k, v) for k, v in _user_vars.items()
-                           if k not in prev_lambda_keys and isinstance(v, Lambda)]
-            for k, v in new_lambdas:
-                print(f"  {_longvar_inner(k) if _is_longvar(k) else k} = {v}")
-            if not new_lambdas:
+                    print(f"{_longvar_inner(tgt) if _is_longvar(tgt) else tgt} = {ev}")
+                    shown = True
+            if not shown:
                 print(_fmt_error("No expression found after assignments."))
         else:
             print(_fmt_error("No expression found after assignments."))
