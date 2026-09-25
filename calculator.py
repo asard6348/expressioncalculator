@@ -100,6 +100,65 @@ class _DisplayDec(dec):
     def __repr__(self):
         return self.__str__()
 
+class _Str(str):
+    def _as_dec(self):
+        return dec(str(self))
+
+    def __add__(self, o):
+        if isinstance(o, str):
+            return _Str(str.__add__(self, o))
+        if isinstance(o, (dec, mpmath.mpc, mpmath.mpf)):
+            return self._as_dec() + o
+        return NotImplemented
+    def __radd__(self, o):
+        if isinstance(o, str):
+            return _Str(o + str(self))
+        if isinstance(o, (dec, mpmath.mpc, mpmath.mpf)):
+            return o + self._as_dec()
+        return NotImplemented
+    def __sub__(self, o):
+        if isinstance(o, (dec, mpmath.mpc, mpmath.mpf)):
+            return self._as_dec() - o
+        return NotImplemented
+    def __rsub__(self, o):
+        if isinstance(o, (dec, mpmath.mpc, mpmath.mpf)):
+            return o - self._as_dec()
+        return NotImplemented
+    def __mul__(self, o):
+        if isinstance(o, (dec, mpmath.mpc, mpmath.mpf)):
+            return self._as_dec() * o
+        if isinstance(o, int):
+            return _Str(str.__mul__(self, o))
+        return NotImplemented
+    def __rmul__(self, o):
+        if isinstance(o, (dec, mpmath.mpc, mpmath.mpf)):
+            return o * self._as_dec()
+        if isinstance(o, int):
+            return _Str(str.__mul__(self, o))
+        return NotImplemented
+    def __truediv__(self, o):
+        if isinstance(o, (dec, mpmath.mpc, mpmath.mpf)):
+            return self._as_dec() / o
+        return NotImplemented
+    def __rtruediv__(self, o):
+        if isinstance(o, (dec, mpmath.mpc, mpmath.mpf)):
+            return o / self._as_dec()
+        return NotImplemented
+    def __pow__(self, o):
+        if isinstance(o, (dec, mpmath.mpc, mpmath.mpf)):
+            return self._as_dec() ** o
+        return NotImplemented
+    def __rpow__(self, o):
+        if isinstance(o, (dec, mpmath.mpc, mpmath.mpf)):
+            return o ** self._as_dec()
+        return NotImplemented
+    def __neg__(self):
+        return -self._as_dec()
+    def __pos__(self):
+        return self._as_dec()
+    def __abs__(self):
+        return abs(self._as_dec())
+
 
 def get_sub_specs(s: str) -> list:
     specs  = []
@@ -275,7 +334,7 @@ def _catkey(*args):
             parts.append(str(int(a)) if a == a.to_integral_value() else str(a))
         else:
             parts.append(str(a))
-    return ''.join(parts)
+    return _Str(''.join(parts))
 
 def _apply_pipes(tokens: list) -> list:
     n = len(tokens)
@@ -343,7 +402,7 @@ def get_clean_tokens(s: str) -> list:
         for t in gen:
 
             if t.type == tokenize.STRING:
-                inner = t.string[1:-1]                             
+                inner = t.string[1:-1]
                 raw_tokens.append(Tok(_TOK_STRING, inner))
                 continue
 
@@ -535,8 +594,8 @@ class Lambda:
             elif isinstance(val, (int, float)):
                 v[name] = dec(str(val))
             else:
-                v[name] = val                              
-        return cal(self.expr, v)                                  
+                v[name] = val
+        return cal(self.expr, v)
 
 
     def _arith(self, other, op: str, flipped: bool = False):
@@ -622,7 +681,7 @@ class SetObj:
     def __getitem__(self, key):
         if self.kind == 'zeros2d':
             if not isinstance(key, tuple) or len(key) != 2:
-                return _fmt_error("2D Set requires two indices: s[r,c]")
+                raise CalcError("2D Set requires two indices: s[r,c]")
             r, c = key
             r = r if isinstance(r, dec) else dec(str(r))
             c = c if isinstance(c, dec) else dec(str(c))
@@ -638,7 +697,7 @@ class SetObj:
 
         if isinstance(key, mpmath.mpc):
             if abs(key.imag) > 1e-30:
-                return _fmt_error("Set indices must be real.")
+                raise CalcError("Set indices must be real.")
             key = dec(mpmath.nstr(key.real, mpmath.mp.dps))
 
         v = key if isinstance(key, dec) else dec(str(key))
@@ -671,7 +730,7 @@ class SetObj:
 
         n = len(self.values)
         if n == 0:
-            return _fmt_error("Set is empty.")
+            raise CalcError("Set is empty.")
         idx = int(v.to_integral_value(rounding=decimal.ROUND_HALF_UP)) % n
         item = self.values[idx]
         if isinstance(item, _FmtVal):
@@ -760,10 +819,10 @@ def _make_set_ineq(*clauses):
     parsed = [_make_clause(*c) for c in clauses]
     for lo, lo_i, hi, hi_i, override in parsed:
         if lo > hi or (lo == hi and not (lo_i and hi_i)):
-            return _fmt_error("Set clause has no valid range (e.g. '>10<0' \u2014 did you mean a comma for union, like '>10,<0'?)")
+            raise CalcError("Set clause has no valid range (e.g. '>10<0' \u2014 did you mean a comma for union, like '>10,<0'?)")
     return SetObj('ineq', clauses=parsed)
 
-    
+
 
 
 dco = {
@@ -839,12 +898,16 @@ dco['int']    = _int
 dco['round']  = _round
 dco['rad']    = dco['radians']
 dco['deg']    = dco['degrees']
-dco['repeat'] = lambda *_: _fmt_error("repeat() must be a top-level call: repeat(expr, n)")
-dco['findroot'] = lambda *_: _fmt_error("findroot() must be a top-level call: findroot(expr, x0)")
+def _repeat_not_toplevel(*_):
+    raise CalcError("repeat() must be a top-level call: repeat(expr, n)")
+def _findroot_not_toplevel(*_):
+    raise CalcError("findroot() must be a top-level call: findroot(expr, x0)")
+dco['repeat'] = _repeat_not_toplevel
+dco['findroot'] = _findroot_not_toplevel
 dco['mpf'] = lambda x: mpmath.mpf(str(x))
 dco['mpc'] = lambda r, i: mpmath.mpc(str(r), str(i))
 dco['i'] = mpmath.mpc(0, 1)
-dco['cat'] = _catkey
+dco['str'] = _catkey
 dco['true'] = True
 dco['false'] = False
 
@@ -864,17 +927,17 @@ _repin_constants()
 
 def _hydrogen_e(n):
     n = int(n)
-    if n < 1: return _fmt_error("hydrogen_e: n must be ≥ 1")
+    if n < 1: raise CalcError("hydrogen_e: n must be ≥ 1")
     return _to_dec(mpmath.mpf('-1') / (2 * n * n))
 dco['hydrogen_e'] = _hydrogen_e
 
 
 def _findroot(f, *x0):
     if not isinstance(f, Lambda):
-        return _fmt_error("findroot() expects a Lambda (quoted expression) as first argument. "
+        raise CalcError("findroot() expects a Lambda (quoted expression) as first argument. "
                           "Example: findroot(\"x**2-4\", 1)")
     if not f.params:
-        return _fmt_error("findroot(): expression has no free variable.")
+        raise CalcError("findroot(): expression has no free variable.")
 
     def mp_f(*args):
         v = {name: dec(mpmath.nstr(val, ctx.prec + 5)) for name, val in zip(f.params, args)}
@@ -892,10 +955,10 @@ dco['findroot'] = _findroot
 
 def _integrate(f, a, b):
     if not isinstance(f, Lambda):
-        return _fmt_error("integrate() expects a Lambda (quoted expression) as first argument. "
+        raise CalcError("integrate() expects a Lambda (quoted expression) as first argument. "
                           "Example: integrate(\"sin(x)\", 0, pi)")
     if not f.params:
-        return _fmt_error("integrate(): expression has no free variable.")
+        raise CalcError("integrate(): expression has no free variable.")
     var = f.params[0]
 
     def _lim(v):
@@ -907,7 +970,7 @@ def _integrate(f, a, b):
 
     a_mp, b_mp = _lim(a), _lim(b)
     if a_mp is None or b_mp is None:
-        return _fmt_error("integrate(): limits must be numeric.")
+        raise CalcError("integrate(): limits must be numeric.")
 
     def integrand(t):
         v = dec(mpmath.nstr(t, ctx.prec + 5))
@@ -917,7 +980,7 @@ def _integrate(f, a, b):
     try:
         result = mpmath.quad(integrand, [a_mp, b_mp])
     except Exception as err:
-        return _fmt_error(f"integrate(): {err}")
+        raise CalcError(f"integrate(): {err}")
 
     result_dec = dec(mpmath.nstr(result, mpmath.mp.dps))
     if abs(result_dec) < dec('1e-' + str(ctx.prec - 2)):
@@ -928,10 +991,10 @@ dco['integrate'] = _integrate
 
 def _schrodinger(V, n, xmin, xmax, Npts=dec(100)):
     if not isinstance(V, Lambda):
-        return _fmt_error("schrodinger() expects a Lambda (quoted expression) as first argument. "
+        raise CalcError("schrodinger() expects a Lambda (quoted expression) as first argument. "
                           "Example: schrodinger(\"x**2/2\", 0, -8, 8)")
     if not V.params:
-        return _fmt_error("schrodinger(): expression has no free variable.")
+        raise CalcError("schrodinger(): expression has no free variable.")
     var    = V.params[0]
     n      = int(n)
     Npts   = int(Npts)
@@ -950,7 +1013,7 @@ def _schrodinger(V, n, xmin, xmax, Npts=dec(100)):
     E, _ = mpmath.eigsy(H)
     vals = sorted([E[i] for i in range(Npts)], key=lambda v: float(mpmath.re(v)))
     if n >= len(vals):
-        return _fmt_error(f"schrodinger(): n={n} out of range (max {len(vals)-1})")
+        raise CalcError(f"schrodinger(): n={n} out of range (max {len(vals)-1})")
     return dec(mpmath.nstr(vals[n], mpmath.mp.dps))
 dco['schrodinger'] = _schrodinger
 
@@ -979,12 +1042,12 @@ def _run_lambda(*args):
     else:
         f, vals = _last_lambda[0], args
     if not isinstance(f, Lambda):
-        return _fmt_error("run() expects a Lambda as first argument, or a prior "
+        raise CalcError("run() expects a Lambda as first argument, or a prior "
                           "unassigned Lambda result to reuse. Example: run(f, 2, 3)")
     if not f.params:
         return f()
     if not vals:
-        return _fmt_error(f"run() missing argument(s) for: {', '.join(f.params)}")
+        raise CalcError(f"run() missing argument(s) for: {', '.join(f.params)}")
     call_args = [vals[i % len(vals)] for i in range(len(f.params))]
     return f(*call_args)
 dco['run'] = _run_lambda
@@ -1006,7 +1069,7 @@ def _zeros(*args):
     if len(args) == 2:
         rows, cols = int(args[0]), int(args[1])
         return SetObj('zeros2d', rows=rows, cols=cols)
-    return _fmt_error("zeros() takes 1 or 2 arguments: zeros(n) or zeros(rows, cols)")
+    raise CalcError("zeros() takes 1 or 2 arguments: zeros(n) or zeros(rows, cols)")
 dco['zeros'] = _zeros
 
 
@@ -1017,13 +1080,24 @@ def _range_set(*args):
     if len(args) == 2:
         start, stop = int(args[0]), int(args[1])
         return SetObj('range', values=[dec(k) for k in range(start, stop)])
-    return _fmt_error("range() takes 1 or 2 arguments: range(n) or range(start, stop)")
+    raise CalcError("range() takes 1 or 2 arguments: range(n) or range(start, stop)")
 dco['range'] = _range_set
+
+
+def _interval(*args):
+    if len(args) == 1:
+        lo, hi = dec(0), args[0]
+    elif len(args) == 2:
+        lo, hi = args[0], args[1]
+    else:
+        raise CalcError("interval() takes 1 or 2 arguments: interval(end) or interval(start, end)")
+    return _make_set_ineq(('>', lo, '<', hi, None))
+dco['interval'] = _interval
 
 
 def _set_anchor_lo(base, offset):
     if not isinstance(base, SetObj):
-        return _fmt_error("inf-anchor indexing can only be used on a Set.")
+        raise CalcError("inf-anchor indexing can only be used on a Set.")
     L, _ = base._bounds()
     off = offset if isinstance(offset, dec) else dec(str(offset))
     return L + off
@@ -1032,11 +1106,56 @@ dco['setanchorlo'] = _set_anchor_lo
 
 def _set_anchor_hi(base, offset):
     if not isinstance(base, SetObj):
-        return _fmt_error("inf-anchor indexing can only be used on a Set.")
+        raise CalcError("inf-anchor indexing can only be used on a Set.")
     _, U = base._bounds()
     off = offset if isinstance(offset, dec) else dec(str(offset))
     return U + off
 dco['setanchorhi'] = _set_anchor_hi
+
+
+def _dec_fn(*args):
+    if not args:
+        raise CalcError("dec() requires at least one argument.")
+    total = dec(0)
+    for x in args:
+        if isinstance(x, dec):
+            total += x
+        elif isinstance(x, mpmath.mpc):
+            im = dec(mpmath.nstr(x.imag, mpmath.mp.dps))
+            if abs(im) < dec('1e-30'):
+                total += dec(mpmath.nstr(x.real, mpmath.mp.dps))
+            else:
+                raise CalcError("dec(): cannot convert a complex number with nonzero imaginary part.")
+        elif isinstance(x, mpmath.mpf):
+            total += dec(mpmath.nstr(x, mpmath.mp.dps))
+        elif isinstance(x, Lambda):
+            r = x()
+            if isinstance(r, _MissingArgs):
+                return r
+            if isinstance(r, str):
+                return r
+            if isinstance(r, mpmath.mpc):
+                im = dec(mpmath.nstr(r.imag, mpmath.mp.dps))
+                if abs(im) < dec('1e-30'):
+                    r = dec(mpmath.nstr(r.real, mpmath.mp.dps))
+                else:
+                    raise CalcError("dec(): cannot convert a complex number with nonzero imaginary part.")
+            elif isinstance(r, mpmath.mpf):
+                r = dec(mpmath.nstr(r, mpmath.mp.dps))
+            elif not isinstance(r, dec):
+                raise CalcError("dec(): Lambda did not evaluate to a number.")
+            total += r
+        elif isinstance(x, str):
+            with decimal.localcontext() as _lc:
+                _lc.traps[decimal.InvalidOperation] = True
+                try:
+                    total += dec(x)
+                except decimal.InvalidOperation:
+                    raise CalcError(f"dec(): cannot convert '{x}' to a number.")
+        else:
+            raise CalcError(f"dec(): cannot convert '{x}' to a number.")
+    return total
+dco['dec'] = _dec_fn
 
 
 def _simp(node):
@@ -1069,7 +1188,7 @@ def _simp(node):
 
         if isinstance(L, ast.Constant) and isinstance(R, ast.Constant):
             try:
-                v = eval(ast.unparse(ast.BinOp(L, op, R)))                      
+                v = eval(ast.unparse(ast.BinOp(L, op, R)))
                 if isinstance(v, (int, float)) and not isinstance(v, bool):
                     return ast.Constant(value=v)
             except Exception:
@@ -1083,7 +1202,7 @@ def _simp(node):
         if isinstance(node.op, ast.USub):
             if isinstance(op, ast.Constant):   return ast.Constant(value=-op.value)
             if isinstance(op, ast.UnaryOp) and isinstance(op.op, ast.USub):
-                return op.operand                         
+                return op.operand
         elif isinstance(node.op, ast.UAdd):
             return op
         node.operand = op
@@ -1121,13 +1240,13 @@ def _diff_node(node, var: str):
         if isinstance(op, (ast.Add, ast.Sub)):
             return _simp(ast.BinOp(dL, op, dR))
 
-        if isinstance(op, ast.Mult):                         
+        if isinstance(op, ast.Mult):
             return _simp(ast.BinOp(
                 ast.BinOp(dL, ast.Mult(), R),
                 ast.Add(),
                 ast.BinOp(L, ast.Mult(), dR)))
 
-        if isinstance(op, ast.Div):                           
+        if isinstance(op, ast.Div):
             return _simp(ast.BinOp(
                 ast.BinOp(
                     ast.BinOp(dL, ast.Mult(), R),
@@ -1212,12 +1331,12 @@ def _symbolic_diff(expr_str: str, var: str, order: int = 1) -> str:
         ast.fix_missing_locations(node)
         return ast.unparse(node)
     except Exception as err:
-        return _fmt_error(f"Symbolic diff error: {err}")
+        raise CalcError(f"Symbolic diff error: {err}")
 
 
 def _diff_lambda(f, order=None):
     if not isinstance(f, Lambda):
-        return _fmt_error("diff() expects a Lambda (quoted expression). "
+        raise CalcError("diff() expects a Lambda (quoted expression). "
                           "Example: diff(\"sin(x)\")")
     if not f.params:
         return Lambda("0", [])
@@ -1225,7 +1344,7 @@ def _diff_lambda(f, order=None):
     n      = int(order) if isinstance(order, dec) else 1
     d_expr = _symbolic_diff(f.expr, var, n)
     if d_expr.startswith('\x1b'):
-        return d_expr                                     
+        return d_expr
     return Lambda(d_expr, f.params)
 
 dco['diff'] = _diff_lambda
@@ -1269,8 +1388,8 @@ def _cal_mpf(expr: str, var: str, t):
         return mpmath.mpf('0')
 
 
-_user_vars:   dict  = {}                                           
-_last_lambda: list  = [None]                                       
+_user_vars:   dict  = {}
+_last_lambda: list  = [None]
 
 
 def _fmt_error(msg: str) -> str:
@@ -1279,14 +1398,19 @@ def _fmt_error(msg: str) -> str:
 def _fmt_error_info(msg: str) -> str:
     return f"{DRED}{msg}{RST}"
 
+class CalcError(Exception):
+    pass
+
 
 if len(sys.argv) <= 1:
     print(f"""Arbitrary-precision mathematical expression REPL.
 {GRAY}Commands: help / new / back (or Ctrl+C/D) / toggle / img (use constant i) / prec <n> / clear
-Operators: + − * / **
+Operators: + − * / ** //
 Variables: single letters / word in underscores
-Subscript: e.g. x[1] / _work_[0]
-Inline: e.g. x=0 (when setting a variable) / f=\"sin(x)\"; f(rad(x)){RST}\n""")
+Subscript: e.g. x[1] / _work_[0] / {{0,1}}[0]
+Inline: e.g. x=0 (when setting a variable) / f=\"sin(x)\"; f(rad(x))
+Strings: e.g. [hello!] / p[[work]] / {{0,1[ is whole]}}[1]
+Sets: e.g. {{1,2,3}} / {{>=0<20}} / {{<0,>0}} (comma = union){RST}\n""")
 
 
 def _display(result: dec) -> dec:
@@ -1392,7 +1516,7 @@ def _is_naked(prev_last, curr_first, v_dict):
     return not _needs_mul(prev_last, curr_first, prev_last.string, v_dict)
 
 
-def _group_tokens(tokens: list, lo: int, hi: int, v_dict: dict, in_subscript: bool = False) -> str:
+def _group_tokens(tokens: list, lo: int, hi: int, v_dict: dict, in_subscript: bool = False, in_str_call: bool = False) -> str:
     atoms = []
     i = lo
     while i < hi:
@@ -1424,12 +1548,36 @@ def _group_tokens(tokens: list, lo: int, hi: int, v_dict: dict, in_subscript: bo
             if open_ch == '[' and i + 1 < j - 1 and tokens[i+1].string in _CMP_OPS:
                 inner = _build_set_source(tokens[i+1:j-1], v_dict)
             else:
-                inner = _group_tokens(tokens, i + 1, j - 1, v_dict, in_subscript=(open_ch == '['))
+                child_in_str = in_str_call or (
+                    open_ch == '(' and atoms and
+                    atoms[-1][2].type == tokenize.NAME and
+                    atoms[-1][2].string == 'str'
+                )
+                inner = _group_tokens(tokens, i + 1, j - 1, v_dict,
+                                       in_subscript=(open_ch == '['),
+                                       in_str_call=child_in_str)
             atoms.append((open_ch + inner + close_ch, t, tokens[j - 1]))
             i = j
         else:
             atoms.append((_tok_text(t), t, t))
             i += 1
+
+    folded = []
+    ai = 0
+    while ai < len(atoms):
+        text, first_tok, last_tok = atoms[ai]
+        if (first_tok is last_tok and first_tok.string in ('-', '+') and
+                ai + 1 < len(atoms) and
+                atoms[ai + 1][1].type == tokenize.NUMBER and
+                (ai == 0 or atoms[ai - 1][2].type == _TOK_SFSTRING)):
+            sign = first_tok.string
+            num_text, num_first, num_last = atoms[ai + 1]
+            folded.append((f'(-{num_text})' if sign == '-' else num_text, num_first, num_last))
+            ai += 2
+            continue
+        folded.append(atoms[ai])
+        ai += 1
+    atoms = folded
 
     pieces = []
     k = 0
@@ -1454,7 +1602,7 @@ def _group_tokens(tokens: list, lo: int, hi: int, v_dict: dict, in_subscript: bo
                 atoms[k + j2][1].type == _TOK_SFSTRING
                 for j2 in range(m - k + 1)
             )
-            if in_subscript and has_sfstr_in_chain:
+            if has_sfstr_in_chain and in_str_call:
                 args = []; num_group = []
                 for j2 in range(m - k + 1):
                     if atoms[k + j2][1].type == _TOK_SFSTRING:
@@ -1466,7 +1614,14 @@ def _group_tokens(tokens: list, lo: int, hi: int, v_dict: dict, in_subscript: bo
                         num_group.append(chain[j2])
                 if num_group:
                     args.append('(' + '*'.join(num_group) + ')' if len(num_group) > 1 else num_group[0])
-                pieces.append('cat(' + ', '.join(args) + ')')
+                pieces.append('str(' + ', '.join(args) + ')')
+            elif has_sfstr_in_chain:
+                num_group = [chain[j2] for j2 in range(m - k + 1)
+                             if atoms[k + j2][1].type != _TOK_SFSTRING]
+                if num_group:
+                    pieces.append('(' + '*'.join(num_group) + ')' if len(num_group) > 1 else num_group[0])
+                else:
+                    pieces.append('""')
             elif not unsafe_start and not unsafe_end:
                 pieces.append('(' + '*'.join(chain) + ')')
             else:
@@ -1595,15 +1750,15 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
     if v_dict is None:
         v_dict = {}
 
-    if expr.strip().startswith('repeat(') and expr.strip().endswith(')'):
-        return _eval_repeat(expr.strip(), v_dict, chk)
-    if expr.strip().startswith('findroot(') and expr.strip().endswith(')'):
-        return _eval_findroot(expr.strip(), v_dict, chk)
-
     try:
+        if expr.strip().startswith('repeat(') and expr.strip().endswith(')'):
+            return _eval_repeat(expr.strip(), v_dict, chk)
+        if expr.strip().startswith('findroot(') and expr.strip().endswith(')'):
+            return _eval_findroot(expr.strip(), v_dict, chk)
+
         tokens = get_clean_tokens(expr)
         if not tokens and expr.strip():
-            return _fmt_error("The given expression has invalid syntax.")
+            return _fmt_error("The given expression has invalid syntax.\n")+_fmt_error_info(f"[{expr}]")
         tokens, _sfmt = _extract_format_sfstrings(tokens)
         if not nodisplay and not chk:
             _last_fmt_parts.clear(); _last_fmt_parts.extend(_sfmt)
@@ -1614,9 +1769,9 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
             if (tokens[idx].type == tokenize.NAME and
                     tokens[idx+1].string == '[' and
                     tokens[idx+2].type == _TOK_STRING):
-                return _fmt_error("The given expression has invalid syntax.")
+                return _fmt_error("The given expression has invalid syntax.\n")+_fmt_error_info(f"[{expr}]")
 
-        env = {**dco, **{k: (dec(v) if isinstance(v, _DisplayDec) else v) for k, v in v_dict.items()}, 'dec': dec, 'mpmath': mpmath, 'Lambda': Lambda, '_make_set_list': _make_set_list, '_make_set_ineq': _make_set_ineq, '_make_fmtval': _make_fmtval}
+        env = {**dco, **{k: (dec(v) if isinstance(v, _DisplayDec) else v) for k, v in v_dict.items()}, 'mpmath': mpmath, 'Lambda': Lambda, '_make_set_list': _make_set_list, '_make_set_ineq': _make_set_ineq, '_make_fmtval': _make_fmtval}
 
         for idx in range(len(tokens) - 2):
             t0, t1, t2 = tokens[idx], tokens[idx+1], tokens[idx+2]
@@ -1626,7 +1781,7 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
                 if target is not None and not callable(target):
                     if chk: return dec(1)
                     disp = _longvar_inner(t0.string) if _is_longvar(t0.string) else t0.string
-                    return _fmt_error(f"'{disp}' is not a function.")
+                    return _fmt_error(f"'{disp}' is not a function.\n")+_fmt_error_info(f"[{expr}]")
 
         fin = _group_tokens(tokens, 0, len(tokens), v_dict)
 
@@ -1660,6 +1815,8 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
                 return raw
 
             if isinstance(raw, str):
+                if chk:
+                    return dec(1)
                 return raw
 
 
@@ -1670,7 +1827,7 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
                 if chk:
                     return dec(1)
                 if not IMG:
-                    return _fmt_error("No real solutions.")
+                    return _fmt_error("No real solutions.\n")+_fmt_error_info(f"[{fin}]")
                 return raw
 
 
@@ -1721,10 +1878,15 @@ def cal(expr: str, v_dict: dict = None, chk: bool = False, nodisplay: bool = Fal
         except OverflowError:
             if chk: return dec(1)
             return _fmt_error("Numerical overflow.\n")+_fmt_error_info(f"[{fin}]")
+        except CalcError as ce:
+            if chk: return dec(1)
+            return _fmt_error(f"{ce}\n")+_fmt_error_info(f"[{fin}]")
         except Exception:
             if chk: return dec(1)
             raise
 
+    except CalcError as ce:
+        return _fmt_error(f"{ce}\n")+_fmt_error_info(f"[{expr}]")
     except Exception as e:
         return _fmt_error(f"Calculation problem: {e}\n")+_fmt_error_info(f"[{expr}]")
 
@@ -1747,7 +1909,7 @@ def _parse_repeat(expr: str):
 def _eval_repeat(expr: str, v_dict: dict, chk: bool = False):
     parsed = _parse_repeat(expr)
     if parsed is None:
-        return _fmt_error("repeat() syntax: repeat(expression, count)")
+        raise CalcError("repeat() syntax: repeat(expression, count)")
     inner_expr, n_str = parsed
     if chk: return cal(inner_expr, v_dict, chk=True)
     n_val = cal(n_str, v_dict, chk)
@@ -1755,8 +1917,8 @@ def _eval_repeat(expr: str, v_dict: dict, chk: bool = False):
     try:
         n = int(n_val)
     except Exception:
-        return _fmt_error("repeat() count must be a whole number.")
-    if n <= 0: return _fmt_error("repeat() count must be positive.")
+        raise CalcError("repeat() count must be a whole number.")
+    if n <= 0: raise CalcError("repeat() count must be positive.")
     vars_in = getv(inner_expr)
     target  = vars_in[0] if vars_in else None
     result  = dec(0)
@@ -1786,18 +1948,18 @@ def _parse_findroot(expr: str):
 def _eval_findroot(expr: str, v_dict: dict, chk: bool = False):
     parts = _parse_findroot(expr)
     if parts is None:
-        return _fmt_error("findroot() syntax: findroot(expr, x0[, x1])")
+        raise CalcError("findroot() syntax: findroot(expr, x0[, x1])")
 
     expr_part = parts[0]
     quoted = ((expr_part.startswith('"') and expr_part.endswith('"')) or
               (expr_part.startswith("'") and expr_part.endswith("'")))
     if not quoted:
-        return _fmt_error("findroot() expects a Lambda (quoted expression) as first argument. "
+        raise CalcError("findroot() expects a Lambda (quoted expression) as first argument. "
                           "Example: findroot(\"x**2-4\", 1)")
     lam_expr = expr_part[1:-1]
     params   = _get_lambda_params(lam_expr)
     if not params:
-        return _fmt_error("findroot(): expression has no free variable.")
+        raise CalcError("findroot(): expression has no free variable.")
     root_var, extra = params[0], params[1:]
 
     if chk:
@@ -1843,7 +2005,7 @@ def _eval_findroot(expr: str, v_dict: dict, chk: bool = False):
         except ValueError as err2:
             if last_err[0] is not None:
                 return last_err[0]
-            return _fmt_error(f"findroot: {str(err2).splitlines()[0]}")
+            raise CalcError(f"findroot: {str(err2).splitlines()[0]}")
 
     return _display(_to_dec(result))
 
@@ -2128,12 +2290,16 @@ def apply_inline(inline_str: str, all_vars: list, base: dict, isolate: bool, rep
     return work if isolate else base
 
 
+_SUBSCRIPTABLE_FNS = {'zeros', 'range', 'interval'}
+
 def _strip_spaces(s: str) -> str:
     buf = []
     in_str = False; str_char = ''
     last_was_callable = False
     prev_was_alnum = False
     run_is_name = False
+    cur_run = ''
+    paren_names = []
     i = 0
     while i < len(s):
         ch = s[i]
@@ -2162,11 +2328,21 @@ def _strip_spaces(s: str) -> str:
                     j += 1
                 buf.append(' '); buf.append(_register_sfstr(s[i+1:j-1])); buf.append(' ')
                 last_was_callable = False; prev_was_alnum = False; i = j
-        elif ch in (')', ']', '}'):
+        elif ch == '(':
+            paren_names.append(cur_run if run_is_name else None)
+            buf.append(ch); last_was_callable = False; prev_was_alnum = False; i += 1
+        elif ch == ')':
+            fname = paren_names.pop() if paren_names else None
+            buf.append(ch)
+            last_was_callable = fname in _SUBSCRIPTABLE_FNS
+            prev_was_alnum = False; i += 1
+        elif ch in (']', '}'):
             buf.append(ch); last_was_callable = True; prev_was_alnum = False; i += 1
         elif ch.isalnum():
             if not prev_was_alnum:
                 run_is_name = ch.isalpha()
+                cur_run = ''
+            cur_run += ch
             buf.append(ch)
             last_was_callable = run_is_name
             prev_was_alnum = True
